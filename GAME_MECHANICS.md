@@ -156,6 +156,12 @@ Usage:
 - `Entity.ActiveStatuses` is a `Dictionary<Status,int>` — the `int` is used as a duration/turn counter for each status (implementer must decrement per turn).
 - Use `Entity.HasStatus(Status s)` helper to query presence.
 
+### Dizzy (precise server behavior)
+- When a player has `Status.Dizzy`, the server mirrors the requested move across the player's current position: it computes the requested delta `(dx,dy) = (req.X - cur.X, req.Y - cur.Y)` and sets the new position to `cur - (dx,dy)` (clamped to map bounds).
+- If mirroring on an axis results in no change (due to clamping), the server will instead attempt a single-step in the original direction on that axis (clamped).
+- If the final mirrored position is not reachable, the server does **not** throw an error; it picks a random reachable position for the dizzy player instead.
+- Implementation reference (decompiled server): [Server.Services/PlayerServices.Move handling](decompiled_server/Server.Services/PlayerServices.cs#L36-L64).
+
 ## End conditions
 - Explicit GameState: the game loop uses `GameState` values (from README) — `Player1Turn`, `Player2Turn`, `MonsterTurn`. Implementers should also support an explicit `Ending` or equivalent `GameState` to signal the game is over (server-side may set such a state; treat it as terminal).
 - Inferred health-based end:
