@@ -1,0 +1,10 @@
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+.vs/slnx.sqlite
+.vs/TEST-BOT/DesignTimeBuild/.dtbcache.v2
+.vs/TEST-BOT/FileContentIndex/63c835b2-dfa4-4e53-85d7-2e99a8168eed.vsidx
+.vs/TEST-BOT/v17/.suo
+.vs/TEST-BOT/FileContentIndex/6a0937e1-33b9-447d-8a0e-160a1e851b46.vsidx
