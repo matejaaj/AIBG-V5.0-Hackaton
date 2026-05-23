@@ -102,6 +102,9 @@ def decide(bot):
         return
 
     # ── PHASE B: hold the zone — act only inside it, never leave ──
+    if summon_monster(within=safe):
+        return
+
     if enemy and bot.can_attack(enemy) and safe(enemy.position):
         log("action: attack enemy", enemy.position)
         bot.attack(enemy)
@@ -115,9 +118,6 @@ def decide(bot):
         log("action: close on enemy", enemy.position)
         if bot.move_toward(enemy, within=safe):
             return
-
-    if summon_monster(within=safe):
-        return
 
     # The server has no "pass": always submit a move. Drift toward center (a
     # harmless shuffle once we're there); if boxed in, take any legal safe move.
