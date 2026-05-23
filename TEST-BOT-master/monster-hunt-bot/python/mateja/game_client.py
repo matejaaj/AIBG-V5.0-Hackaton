@@ -94,10 +94,16 @@ class Bot:
                 f"enemy={en.position if en else None} dist={d} "
                 f"safe_here={here} shrink_in={shrink}")
 
-    def save_state(self, path="bot_state.json"):
-        """Dump the latest raw game state to a file (send this for debugging)."""
+    def save_state(self, path=None):
+        """Dump the latest raw game state to a file (send this for debugging).
+        Defaults to a fixed path next to the script, so it's findable even when
+        the GUI launches the bot from an unknown working directory."""
         if self.state is None:
             return None
+        if path is None:
+            path = str(CURRENT_DIR / "bot_state.json")
+        elif not Path(path).is_absolute():
+            path = str(CURRENT_DIR / path)
         try:
             with open(path, "w") as f:
                 json.dump(self.state, f)
@@ -133,8 +139,8 @@ class Bot:
     def move_toward(self, goal, within=None):
         """Move toward goal as far as this turn allows. If `within` (a pos->bool
         predicate) is given, only step to tiles satisfying it (e.g. the safe zone).
-        Falls back to the reachable tile closest to the goal when the full path
-        step is blocked or rejected, so we make progress instead of freezing.
+        Uses the route-aware path helper to spend the whole turn budget instead of
+        taking only a single step.
         Returns the server response, or None only if no legal (in-region) move exists."""
         if self.me is None:
             return None
@@ -164,6 +170,10 @@ class Bot:
         server's directed attack skips the +X (right) direction, so an enemy
         directly to the right is treated as not attackable."""
         if self.me is None or target is None:
+            return False
+        # Attacking while Fatigued throws server-side and leaks the turn lock
+        # (every later action then 409s forever) — never do it.
+        if self.me.has_status("Fatigue"):
             return False
         mx, my = self.me.position
         tx, ty = _pos(target)

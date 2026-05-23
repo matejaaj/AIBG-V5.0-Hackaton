@@ -17,7 +17,7 @@ if str(CURRENT_DIR) not in sys.path:
 
 from pathfinding import _pos  # noqa: E402
 from game_client import Bot  # noqa: E402
-import bot_template_py as tmpl  # noqa: E402
+import working_dir.final as tmpl  # noqa: E402
 
 
 def main():

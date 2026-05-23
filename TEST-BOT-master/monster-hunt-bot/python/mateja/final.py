@@ -27,6 +27,7 @@ See README.md for the raw HTTP API.
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # Flush each line so the host (BotProcessService) captures our output promptly.
@@ -42,22 +43,35 @@ if str(CURRENT_DIR) not in sys.path:
 from game_client import Bot  # noqa: E402
 from game_api import (  # noqa: E402
     Field, ItemType, Status, Entity, Item,
-    is_pickup, is_healing, is_card, is_powerup, tile_position,
+    is_pickup, tile_position,
 )
-from pathfinding import find_path, reachable, find_nearest, distance  # noqa: E402
+from pathfinding import find_nearest  # noqa: E402
+from strategy_helpers import grab_or_approach, summon_monster, pickup_on_route  # noqa: E402
 
-# How far off the straight line to center we'll detour for a pickup (movement cost).
-DETOUR_MAX = 2
-
-# Set BOT_DEBUG=1 to log a snapshot + the chosen action each turn and dump the
-# latest game state to bot_state.json (send that file + this log for debugging).
-DEBUG = os.environ.get("BOT_DEBUG", "") not in ("", "0", "false", "False")
+# Debug is ON by default (the GUI launcher can't set env vars): logs a snapshot +
+# the chosen action each turn and dumps the latest state to bot_state.json.
+# Set BOT_DEBUG=0 to silence it (e.g. for competition).
+DEBUG = os.environ.get("BOT_DEBUG", "1") not in ("0", "false", "False")
+DEBUG_LOG = CURRENT_DIR / f"bot_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+if DEBUG:
+    try:
+        DEBUG_LOG.write_text("")            # truncate once per run
+    except OSError:
+        pass
 
 
 def log(*args):
-    """Debug print (gated by BOT_DEBUG), flushed so the host captures it."""
-    if DEBUG:
-        print("[BOT]", *args, flush=True)
+    """Debug print (gated by BOT_DEBUG): to stdout (captured by the host) AND to
+    bot_debug.log next to the script, so it's easy to find and send."""
+    if not DEBUG:
+        return
+    line = "[BOT] " + " ".join(str(a) for a in args)
+    print(line, flush=True)
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # ── Strategy: write your if-else tactics here ──────────────────────────────
@@ -78,25 +92,11 @@ def decide(bot):
         bot.use_healing()
         return
 
-    def grab_or_approach(target, within=None):
-        """Pick the target up if adjacent, else move toward it. Returns True if
-        we performed an action (the server has no 'pass', so callers rely on this)."""
-        if bot.is_adjacent(me, target):
-            log("action: pickup", target)
-            tile = world.tile_at(target)
-            (bot.pickup_card if is_card(tile) else bot.pickup)(target)
-            return True
-        log("action: approach pickup", target)
-        return bool(bot.move_toward(target, within=within))
-
     # ── PHASE A: travel to center, with small on-path detours for pickups ──
     if not safe(me.position):
-        pickup = find_nearest(me, is_pickup)
-        if pickup is not None:
-            base = distance(me, center) or 0
-            detour = (distance(me, pickup) or 1e9) + (distance(pickup, center) or 1e9) - base
-            if detour <= DETOUR_MAX and grab_or_approach(pickup):   # barely off the path
-                return
+        pickup = find_nearest(me, lambda t: is_pickup(t) and pickup_on_route(t))
+        if pickup is not None and grab_or_approach(pickup):
+            return
         log("action: travel to center", center)
         bot.move_toward(center) or bot.wander()    # always act — never freeze
         return
@@ -116,10 +116,43 @@ def decide(bot):
         if bot.move_toward(enemy, within=safe):
             return
 
+    if summon_monster(within=safe):
+        return
+
     # The server has no "pass": always submit a move. Drift toward center (a
     # harmless shuffle once we're there); if boxed in, take any legal safe move.
     log("action: hold/shuffle toward center", center)
     bot.move_toward(center, within=safe) or bot.wander(within=safe) or bot.wander()
+
+
+def _turn_key(state):
+    """Identity of a turn — used to detect when our action didn't advance the game."""
+    return (state.get("GameState"), state.get("TurnCounter")) if state else None
+
+
+def run(bot, poll=1.0, pace=0.2):
+    """Main turn loop. Act once when it's our turn, then poll until our next turn.
+    `pace` throttles every action so we never hammer the server."""
+    state = bot.get_game_state()
+    last = time.monotonic()
+    while state and not bot.is_game_over(state):
+        if bot.is_my_turn(state):
+            bot.update(state)
+            now = time.monotonic()
+            if DEBUG:
+                log(f"+{now - last:.2f}s", bot.snapshot())   # real gap since our last turn
+                bot.save_state()            # dump bot_state.json for offline replay
+            last = now
+            try:
+                decide(bot)
+            except Exception as e:          # never let one bad turn kill the bot
+                print("decide() error:", e, flush=True)
+                bot.save_state("bot_error_state.json")
+            time.sleep(pace)                 # pace the game + never hammer the server
+            state = bot.get_game_state()     # turn normally advanced → now the opponent's
+        else:
+            time.sleep(poll)
+            state = bot.get_game_state()
 
 
 if __name__ == "__main__":
@@ -129,31 +162,15 @@ if __name__ == "__main__":
 
     bot = Bot(sys.argv[1], sys.argv[2], sys.argv[3])
 
+    print(f"[BOT] running {os.path.abspath(__file__)} | "
+          f"pace=0.2 poll=1.0 | DEBUG={DEBUG}", flush=True)
+
     while not (state := bot.get_game_state()) or not bot.find_my_player_id(state):
         time.sleep(0.5)
 
-    print(f"Connected as Player {bot.player_id}\n")
+    print(f"Connected as Player {bot.player_id}", flush=True)
 
-    state = bot.get_game_state()
     try:
-        while state and not bot.is_game_over(state):
-            if bot.is_my_turn(state):
-                bot.update(state)
-                if DEBUG:
-                    log(bot.snapshot())
-                    bot.save_state()        # dump bot_state.json for offline replay
-                try:
-                    decide(bot)
-                except Exception as e:  # never let one bad turn kill the bot
-                    print("decide() error:", e, flush=True)
-                    bot.save_state("bot_error_state.json")
-                # Act once per turn: wait for the server to advance past our turn
-                # before deciding again (avoids a 409 from a second action).
-                while state and not bot.is_game_over(state) and bot.is_my_turn(state):
-                    time.sleep(0.2)
-                    state = bot.get_game_state()
-            else:
-                time.sleep(0.2)
-                state = bot.get_game_state()
+        run(bot)
     except KeyboardInterrupt:
         print("\nBot stopped by user")

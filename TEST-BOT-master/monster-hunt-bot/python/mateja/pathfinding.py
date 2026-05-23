@@ -16,6 +16,8 @@ These functions are pure and have no side effects.
 from typing import Tuple, Optional, Set, Callable, Dict, Any
 import heapq
 
+from search_core import SearchState, BreadthFirstSearch  # noqa: E402
+
 __all__ = [
     "bfs", "flood_fill", "find_nearest",
     "find_path", "reachable", "distance", "set_active_map",
@@ -156,69 +158,43 @@ def _neighbors(pos: Position, width: int, height: int):
             yield nx, ny
 
 
-def _bfs_core(start: Position, goal: Position, game_map: Dict[str, Any],
-              width: int, height: int, avoid_spikes: bool) -> Optional[Position]:
-    """Dijkstra from start to goal. Returns first step, or None if unreachable."""
-    frontier = []  # heap of (cost, x, y)
-    sx, sy = start
-    heapq.heappush(frontier, (0, sx, sy))
-    cost_so_far: Dict[Position, int] = {start: 0}
-    parent: Dict[Position, Optional[Position]] = {start: None}
-
-    while frontier:
-        cost, x, y = heapq.heappop(frontier)
-        current = (x, y)
-        if current == goal:
-            path = []
-            node = current
-            while node is not None:
-                path.append(node)
-                node = parent.get(node)
-            path.reverse()
-            return path[1] if len(path) > 1 else None
-
-        for nx, ny in _neighbors(current, width, height):
-            field_type = _get_field_type_at(game_map, nx, ny, width, height)
-            cell = _get_cell_at(game_map, nx, ny, width, height)
-            if not _is_walkable(field_type, cell, avoid_spikes):
-                continue
-            if _cell_is_blocked(cell) and (nx, ny) != goal:
-                continue  # server stops before entity/item/card tiles — route around
-            move_cost = _movement_cost_for(field_type)
-            new_cost = cost_so_far[current] + move_cost
-            neighbor = (nx, ny)
-            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
-                cost_so_far[neighbor] = new_cost
-                parent[neighbor] = current
-                heapq.heappush(frontier, (new_cost, nx, ny))
-
-    return None
-
-
 def bfs(start: Position, goal: Position, game_map: Dict[str, Any]) -> Optional[Position]:
-    """Return the first step from start towards goal using weighted Dijkstra.
+    """Return the first turn-state step from start towards goal.
 
-    Avoids spike/obstacle tiles when a safe path exists. If the only path goes
-    through spikes, takes it anyway. Returns None only when the goal is truly
-    unreachable (e.g. surrounded by walls).
-    If start == goal, returns None (no move needed).
+    The search frontier is turn-based: one edge means one legal move this turn,
+    where the move may cover 1..max_move tiles in a straight line. This keeps
+    the BFS state model aligned with the bot's actual turn mechanics.
     """
-    if start == goal:
+    game_map = _resolve_map(game_map)
+    if game_map is None:
+        return None
+    s = _pos(start)
+    g = _pos(goal)
+    if s is None or g is None or s == g:
         return None
     width, height = _get_map_size(game_map)
-
-    sx, sy = start
-    gx, gy = goal
-    if not (0 <= sx < width and 0 <= sy < height):
+    if not (0 <= s[0] < width and 0 <= s[1] < height):
         return None
-    if not (0 <= gx < width and 0 <= gy < height):
+    if not (0 <= g[0] < width and 0 <= g[1] < height):
         return None
 
-    # Try spike-free path first; fall back to allowing spikes if none exists.
-    result = _bfs_core(start, goal, game_map, width, height, avoid_spikes=True)
-    if result is None:
-        result = _bfs_core(start, goal, game_map, width, height, avoid_spikes=False)
-    return result
+    root = TurnMoveState(game_map, s, _max_move_of(start), goal=g)
+    path, _, _ = BreadthFirstSearch(game_map).search(root)
+    if path and len(path) > 1:
+        return path[1].position
+
+    # Fallback: choose the legal one-turn move that gets closest to the goal.
+    moves = root.get_next_states()
+    if not moves:
+        return None
+
+    def score(pos):
+        d = distance(pos, g, game_map)
+        if d is None:
+            d = 10**9
+        return (d, abs(pos[0] - g[0]) + abs(pos[1] - g[1]), pos[0], pos[1])
+
+    return min((state.position for state in moves), key=score)
 
 
 def _flood_fill_core(start: Position, max_move: int, game_map: Dict[str, Any],
@@ -270,53 +246,8 @@ def flood_fill(start: Position, max_move: int, game_map: Dict[str, Any]) -> Set[
     return reachable
 
 
-def _find_nearest_core(start: Position, condition: Callable[[Dict[str, Any]], bool],
-                       game_map: Dict[str, Any], width: int, height: int,
-                       avoid_spikes: bool) -> Optional[Position]:
-    """Dijkstra nearest-match search. Returns first position satisfying condition."""
-    sx, sy = start
-    frontier = []  # heap of (cost, manhattan, x, y)
-    heapq.heappush(frontier, (0, 0, sx, sy))
-    cost_so_far: Dict[Position, int] = {start: 0}
-
-    while frontier:
-        cost, manhattan, x, y = heapq.heappop(frontier)
-        pos = (x, y)
-        cell = _get_cell_at(game_map, x, y, width, height)
-        if cell is not None and condition(cell):
-            return pos
-
-        for nx, ny in _neighbors(pos, width, height):
-            n_field = _get_field_type_at(game_map, nx, ny, width, height)
-            n_cell = _get_cell_at(game_map, nx, ny, width, height)
-            if not _is_walkable(n_field, n_cell, avoid_spikes):
-                continue
-            # Occupied tiles block movement — but a matching one is a valid target
-            # to stop on (e.g. the item/card we're looking for); route around others.
-            if _cell_is_blocked(n_cell) and not condition(n_cell):
-                continue
-            move_cost = _movement_cost_for(n_field)
-            new_cost = cost_so_far[pos] + move_cost
-            neighbor = (nx, ny)
-            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
-                cost_so_far[neighbor] = new_cost
-                man = abs(nx - sx) + abs(ny - sy)
-                heapq.heappush(frontier, (new_cost, man, nx, ny))
-
-    return None
-
-
 def find_nearest(start, condition: Callable[[Dict[str, Any]], bool], game_map: Dict[str, Any] = None) -> Optional[Position]:
-    """Find nearest position from start for which condition(tile) is True.
-
-    `start` may be a position tuple or an entity with `.position`. `game_map`
-    defaults to the active map set via set_active_map().
-
-    Uses Dijkstra until it finds one or exhausts the reachable area. Returns None
-    when nothing matches. Prefers spike-free paths; falls back to paths through
-    spikes if the target is otherwise unreachable.
-    Tie-breaker: prefer lower cost, then smaller manhattan distance, then lower x,y.
-    """
+    """Find the nearest position matching a tile predicate using turn-state BFS."""
     game_map = _resolve_map(game_map)
     if game_map is None:
         return None
@@ -328,10 +259,9 @@ def find_nearest(start, condition: Callable[[Dict[str, Any]], bool], game_map: D
     if not (0 <= sx < width and 0 <= sy < height):
         return None
 
-    result = _find_nearest_core(start, condition, game_map, width, height, avoid_spikes=True)
-    if result is None:
-        result = _find_nearest_core(start, condition, game_map, width, height, avoid_spikes=False)
-    return result
+    root = NearestPickupState(game_map, start, _max_move_of(start), condition)
+    path, _, _ = BreadthFirstSearch(game_map).search(root)
+    return path[-1].position if path else None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -347,6 +277,95 @@ def _cell_is_blocked(cell) -> bool:
         cell.get('Item')        or cell.get('item')        or
         cell.get('MonsterCard') or cell.get('monsterCard')
     )
+
+
+def _turn_moves(start, max_move, game_map, width, height, allow_blocked_final=None):
+    """All legal end positions reachable in one turn from start.
+
+    The move budget is spent in one straight direction. Each direction can travel
+    1..max_move tiles, stopping before walls, empty tiles, and occupied tiles.
+    If `allow_blocked_final` is provided, a blocked tile may be yielded as a
+    final target when the callback returns True for that cell.
+    """
+    tiles: Set[Position] = set()
+    remaining_start = max_move
+    if _get_field_type_at(game_map, start[0], start[1], width, height) == OBSTACLE_SLOW:
+        remaining_start -= 1
+
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        remaining = remaining_start
+        x, y = start
+        while remaining > 0:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                break
+            ft = _get_field_type_at(game_map, nx, ny, width, height)
+            if ft not in WALKABLE_TYPES:
+                break
+            cost = 2 if ft == OBSTACLE_SLOW else 1
+            if remaining < cost:
+                break
+            cell = _get_cell_at(game_map, nx, ny, width, height)
+            if _cell_is_blocked(cell):
+                if allow_blocked_final is not None and allow_blocked_final(cell):
+                    tiles.add((nx, ny))
+                break
+            tiles.add((nx, ny))
+            x, y = nx, ny
+            remaining -= cost
+    return tiles
+
+
+class TurnMoveState(SearchState):
+    """Turn-based movement state: one node is one position after a turn move."""
+
+    def __init__(self, board, position, max_move, goal=None, parent=None, depth=0):
+        super().__init__(board, parent=parent, depth=depth)
+        self.position = position
+        self.max_move = max_move
+        self.goal = goal
+
+    def unique_hash(self):
+        return self.position
+
+    def is_final_state(self):
+        return self.goal is not None and self.position == self.goal
+
+    def get_next_states(self):
+        width, height = _get_map_size(self.board)
+        next_positions = _turn_moves(self.position, self.max_move, self.board, width, height)
+        return [TurnMoveState(self.board, pos, self.max_move, goal=self.goal,
+                              parent=self, depth=self.depth + 1)
+                for pos in next_positions]
+
+
+class NearestPickupState(SearchState):
+    """Turn-based state for nearest-tile lookup with a tile predicate."""
+
+    def __init__(self, board, position, max_move, condition, parent=None, depth=0):
+        super().__init__(board, parent=parent, depth=depth)
+        self.position = position
+        self.max_move = max_move
+        self.condition = condition
+
+    def unique_hash(self):
+        return self.position
+
+    def is_final_state(self):
+        tile = _get_cell_at(self.board, self.position[0], self.position[1], *_get_map_size(self.board))
+        return tile is not None and self.condition(tile)
+
+    def get_next_states(self):
+        width, height = _get_map_size(self.board)
+
+        def allow_blocked(cell):
+            return self.condition(cell)
+
+        next_positions = _turn_moves(self.position, self.max_move, self.board, width, height,
+                                     allow_blocked_final=allow_blocked)
+        return [NearestPickupState(self.board, pos, self.max_move, self.condition,
+                                   parent=self, depth=self.depth + 1)
+                for pos in next_positions]
 
 
 def _bfs_path(start, goal, game_map, width, height, avoid_spikes):
@@ -419,72 +438,12 @@ def _reachable_one_turn(start, max_move, game_map, width, height):
 
 
 def find_path(start, goal, game_map: Dict[str, Any] = None) -> Optional[Position]:
-    """Best tile to MOVE to this turn, heading toward goal.
-
-    Movement is straight-line and one-direction-per-turn (server rule), so this
-    finds the optimal shortest path (avoiding spikes when possible), then rides
-    the straight prefix of that path as far as the move budget allows — never
-    overshooting past where the path turns. `start`/`goal` may be tuples or
-    entities; `start.max_move` is used as the budget when available.
-
-    Returns the destination tile, or None if no move is possible / already there.
-    """
-    game_map = _resolve_map(game_map)
-    if game_map is None:
-        return None
-    s = _pos(start)
-    g = _pos(goal)
-    if s is None or g is None or s == g:
-        return None
-    width, height = _get_map_size(game_map)
-    if not (0 <= s[0] < width and 0 <= s[1] < height):
-        return None
-    if not (0 <= g[0] < width and 0 <= g[1] < height):
-        return None
-
-    path = _bfs_path(s, g, game_map, width, height, avoid_spikes=True)
-    if path is None:
-        path = _bfs_path(s, g, game_map, width, height, avoid_spikes=False)
-    if not path or len(path) < 2:
-        return None
-
-    dx = _sign(path[1][0] - s[0])
-    dy = _sign(path[1][1] - s[1])
-    remaining = _max_move_of(start)
-    if _get_field_type_at(game_map, s[0], s[1], width, height) == OBSTACLE_SLOW:
-        remaining -= 1
-
-    best = None
-    prev = s
-    for nxt in path[1:]:
-        if (_sign(nxt[0] - prev[0]), _sign(nxt[1] - prev[1])) != (dx, dy):
-            break  # path turns here — stop riding straight
-        ft = _get_field_type_at(game_map, nxt[0], nxt[1], width, height)
-        if ft not in WALKABLE_TYPES:
-            break
-        cost = 2 if ft == OBSTACLE_SLOW else 1
-        if remaining < cost:
-            break
-        if _cell_is_blocked(_get_cell_at(game_map, nxt[0], nxt[1], width, height)):
-            break  # server stops before occupied tiles (e.g. the item/enemy we head to)
-        best = nxt
-        remaining -= cost
-        prev = nxt
-
-    # None when no legal straight step exists (e.g. already adjacent to the
-    # occupied target) — the caller can then pick up / attack instead of moving.
-    return best
+    """Best tile to MOVE to this turn, heading toward goal."""
+    return bfs(start, goal, game_map)
 
 
 def reachable(start, turns: int = 1, game_map: Dict[str, Any] = None) -> Set[Position]:
-    """Set of standable tiles reachable within `turns` turns.
-
-    Mirrors the server's one-turn straight-line reachability and expands it
-    `turns` times (you may change direction between turns). Excludes the start
-    tile and any occupied tile (the server never stops on Entity/Item/Card),
-    so e.g. `enemy.position` will NOT be in this set — use distance()/can_attack
-    to reason about engaging entities.
-    """
+    """Set of standable tiles reachable within `turns` turns."""
     game_map = _resolve_map(game_map)
     if game_map is None:
         return set()
@@ -499,14 +458,14 @@ def reachable(start, turns: int = 1, game_map: Dict[str, Any] = None) -> Set[Pos
     visited: Set[Position] = {s}
     frontier: Set[Position] = {s}
     for _ in range(max(1, int(turns))):
-        nxt: Set[Position] = set()
+        next_frontier: Set[Position] = set()
         for tile in frontier:
-            nxt |= _reachable_one_turn(tile, max_move, game_map, width, height)
-        nxt -= visited
-        if not nxt:
+            next_frontier |= _turn_moves(tile, max_move, game_map, width, height)
+        next_frontier -= visited
+        if not next_frontier:
             break
-        visited |= nxt
-        frontier = nxt
+        visited |= next_frontier
+        frontier = next_frontier
     visited.discard(s)
     return visited
 
