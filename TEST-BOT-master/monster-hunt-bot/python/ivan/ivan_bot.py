@@ -1,10 +1,27 @@
-"""Monster Hunt Bot — priority-based heuristic AI.
+"""Monster Hunt Bot — Ivan strategy (priority-based heuristic AI).
 
 Usage:
-    python bot_template_py.py <server_url> <game_id> <bot_name> [--debug] [--test]
+    python ivan_bot.py <server_url> <game_id> <bot_name> [--debug] [--test]
 
-See README.md for the engine API. Strategy notes live in
-~/.claude/plans/napravi-detaljan-plan-i-polymorphic-pie.md
+Strategy summary:
+  - Tracks enemy position, HP, inventory and status every turn.
+  - Prioritises CC scrolls (Freeze > Confusion) over Healing when
+    picking up items, UNLESS HP is already low.
+  - Routes through slow-obstacle (snow) tiles; only routes through
+    ice-spike tiles when a healing potion is carried (allow_spikes flag).
+  - Zone-trap: map shrinks every 15 turns (columns X <= 2 and X >= 29
+    collapse first).  When the enemy is in the danger strip with <=2
+    turns to the next shrink we freeze/confuse them so they can't escape.
+  - Freeze + attack combo: use Freeze Scroll when close, then close in
+    and attack the locked enemy.  Optionally follow with Ice Cube summon.
+  - Ice Cube + freeze combo: freeze first, summon Ice Cube adjacent to
+    the frozen enemy so the monster gets free hits during MonsterTurn.
+  - Pickup contest: if the enemy is racing us to a CC scroll or monster
+    card we burn a CC scroll to delay them, then sprint to the pickup.
+  - Zone safety (time-based X-axis):
+      Turns 1-12  → stay outside the first/last 3 X-columns (X<=2, X>=29).
+      Turns 13+   → retreat from the first/last 6 X-columns (X<=5, X>=26)
+                    before those columns collapse.
 """
 from __future__ import annotations
 
@@ -14,49 +31,64 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass, field as dc_field
-from typing import Any, Iterable, Optional, Union
+from dataclasses import dataclass
+from typing import Optional, Union
 
 import requests
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-POLL_INTERVAL = 0.2
-HTTP_TIMEOUT = 5.0
-MAX_TURNS = 100
-MAP_W = 32
-MAP_H = 16
-CENTER = (MAP_W // 2, MAP_H // 2)
+POLL_INTERVAL    = 0.2
+HTTP_TIMEOUT     = 5.0
+MAX_TURNS        = 100
+MAP_W            = 32
+MAP_H            = 16
+CENTER           = (MAP_W // 2, MAP_H // 2)
 
-LOW_HP_RATIO = 0.30
-HEAL_HP_RATIO = 0.55
-LATE_GAME_TURN = 70
+LOW_HP_RATIO     = 0.30
+HEAL_HP_RATIO    = 0.55
+LATE_GAME_TURN   = 70
 ANTI_STUCK_WINDOW = 4
 
-# Field types — mirror Models/Field.cs
-F_BASE = 0
-F_NORMAL = 1
-F_OBSTACLE_SLOW = 2
-F_OBSTACLE = 3
-F_POWERUP = 4
-F_WALL = 5
-F_EMPTY = 6
+# Map-shrink mechanics: every SHRINK_INTERVAL turns the outer X columns vanish.
+# Danger zone: X=0..2 (left) and X=29..31 (right) collapse first.
+SHRINK_INTERVAL  = 15
+DANGER_X_LO      = 2   # columns 0-2 vanish (left side)
+DANGER_X_HI      = 29  # columns 29-31 vanish (right side)
 
-# Slow obstacles are technically walkable for the engine (cost 2), but
-# empirically once a player ENDS a move on one, every move attempt the
-# next turn is rejected with no status flag set. We therefore treat them
-# as non-walkable so the bot routes around them entirely.
-WALKABLE = {F_BASE, F_NORMAL, F_POWERUP}
-DEAD_TERRAIN = {F_WALL, F_EMPTY, F_OBSTACLE, F_OBSTACLE_SLOW}
+# Time-based safe-zone thresholds.
+# Turns 1..EARLY_GAME_TURNS : stay outside the first/last 3 X-columns.
+# Turns > EARLY_GAME_TURNS  : must be outside the first/last 6 X-columns.
+EARLY_GAME_TURNS     = 12
+EXTENDED_DANGER_X_LO = 5   # columns 0-5 collapse in later shrinks
+EXTENDED_DANGER_X_HI = 26  # columns 26-31 collapse in later shrinks
 
-# Status enum from Models/Enums/Status.cs
-S_FROZEN = "Frozen"
+# Field types (mirror Models/Field.cs)
+F_BASE           = 0
+F_NORMAL         = 1
+F_OBSTACLE_SLOW  = 2   # snow: safe to walk through, costs +1 movement
+F_OBSTACLE       = 3   # ice spikes: 10 DMG; only use when healing carried
+F_POWERUP        = 4
+F_WALL           = 5
+F_EMPTY          = 6
+
+# Snow (F_OBSTACLE_SLOW) is now in WALKABLE — user wants to prefer snow
+# over spike shortcuts.  Spike tiles are added dynamically via allow_spikes.
+WALKABLE    = {F_BASE, F_NORMAL, F_POWERUP, F_OBSTACLE_SLOW}
+DEAD_TERRAIN = {F_WALL, F_EMPTY}
+
+# Status names
+S_FROZEN  = "Frozen"
 S_FATIGUE = "Fatigue"
-S_DIZZY = "Dizzy"
+S_DIZZY   = "Dizzy"
 
 NEIGHBORS_4 = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
-# ─── Actions ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Action dataclasses
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Move:
@@ -75,6 +107,7 @@ class UseItem:
 class Pickup:
     x: int
     y: int
+    field: dict = None   # full FieldInfo from game state (sent in request body)
 
 @dataclass
 class Summon:
@@ -86,20 +119,17 @@ Action = Union[Move, Attack, UseItem, Pickup, Summon]
 
 
 def action_to_dict(a: Action) -> dict:
-    if isinstance(a, Move):
-        return {"type": "Move", "x": a.x, "y": a.y}
-    if isinstance(a, Attack):
-        return {"type": "Attack", "target": a.target_id}
-    if isinstance(a, UseItem):
-        return {"type": "UseItem", "item": a.item_id}
-    if isinstance(a, Pickup):
-        return {"type": "Pickup", "x": a.x, "y": a.y}
-    if isinstance(a, Summon):
-        return {"type": "Summon", "card": a.card_id, "x": a.x, "y": a.y}
+    if isinstance(a, Move):    return {"type": "Move",    "x": a.x, "y": a.y}
+    if isinstance(a, Attack):  return {"type": "Attack",  "target": a.target_id}
+    if isinstance(a, UseItem): return {"type": "UseItem", "item": a.item_id}
+    if isinstance(a, Pickup):  return {"type": "Pickup",  "x": a.x, "y": a.y}
+    if isinstance(a, Summon):  return {"type": "Summon",  "card": a.card_id, "x": a.x, "y": a.y}
     return {"type": "Unknown"}
 
 
-# ─── HTTP layer ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# HTTP engine
+# ---------------------------------------------------------------------------
 
 class Engine:
     def __init__(self, server_url: str, game_id: str, log: logging.Logger):
@@ -108,10 +138,7 @@ class Engine:
         self.log = log
 
     def _req(self, method: str, path: str, body: Optional[dict] = None) -> Optional[dict]:
-        url = f"{self.url}{path}"
-        # Mutating endpoints must not auto-retry: a retry after a server-side
-        # "Not your turn" can re-submit the move on the *next* phase and
-        # corrupt our turn (we saw this produce 500/409 spam).
+        url      = f"{self.url}{path}"
         attempts = (1,) if method != "GET" else (1, 2)
         for attempt in attempts:
             try:
@@ -121,9 +148,9 @@ class Engine:
                         return r.json()
                     except ValueError:
                         return {"_raw": r.text}
-                self.log.warning("HTTP %s %s -> %s body=%s", method, path, r.status_code, r.text[:200])
+                self.log.warning("HTTP %s %s -> %s  %s", method, path, r.status_code, r.text[:200])
                 if 400 <= r.status_code < 600:
-                    return None  # client/server error — retry won't help on a turn action
+                    return None
             except requests.RequestException as e:
                 self.log.warning("HTTP %s %s attempt %s failed: %s", method, path, attempt, e)
             time.sleep(0.1)
@@ -142,18 +169,32 @@ class Engine:
         if isinstance(a, UseItem):
             return self._req("PUT", f"/player/{player_id}/use-item/{a.item_id}/gameId/{gid}")
         if isinstance(a, Pickup):
-            return self._req("PUT", f"/map/pickup/{player_id}/gameId/{gid}",
-                             {"Position": {"X": a.x, "Y": a.y}})
+            f    = a.field or {}
+            item = _g(f, "Item", "item")
+            card = _g(f, "MonsterCard", "monsterCard")
+            # Build body — server checks fieldInfo.Item / fieldInfo.MonsterCard != null
+            body: dict = {"Position": {"X": a.x, "Y": a.y}}
+            if item and isinstance(item, dict) and "$ref" not in item and "$Ref" not in item:
+                body["Item"] = item
+            if card and isinstance(card, dict) and "$ref" not in card and "$Ref" not in card:
+                body["MonsterCard"] = card
+            # Items → PUT /player/pickup/…   Monster cards → PUT /map/pickup/…
+            if card and isinstance(card, dict) and "$ref" not in card and "$Ref" not in card:
+                return self._req("PUT", f"/map/pickup/{player_id}/gameId/{gid}", body)
+            else:
+                return self._req("PUT", f"/player/pickup/{player_id}/gameId/{gid}", body)
         if isinstance(a, Summon):
             return self._req("PUT", f"/map/{player_id}/summon/{a.card_id}/gameId/{gid}",
                              {"X": a.x, "Y": a.y})
         return None
 
 
-# ─── State helpers (case-insensitive accessors) ───────────────────────────────
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
 
 def _g(d: Optional[dict], *keys: str, default=None):
-    """Get the first present key from a dict (case variants)."""
+    """Return the first present key from a dict (supports case variants)."""
     if not d:
         return default
     for k in keys:
@@ -162,7 +203,7 @@ def _g(d: Optional[dict], *keys: str, default=None):
     return default
 
 
-def _pos(p: Optional[dict]) -> Optional[tuple[int, int]]:
+def _pos(p: Optional[dict]) -> Optional[tuple]:
     if not p:
         return None
     x = _g(p, "X", "x")
@@ -172,21 +213,85 @@ def _pos(p: Optional[dict]) -> Optional[tuple[int, int]]:
     return (int(x), int(y))
 
 
-# ─── GameView: parsing wrapper around raw state ───────────────────────────────
+# ---------------------------------------------------------------------------
+# Item classification helpers
+# ---------------------------------------------------------------------------
+
+def _item_type_label(item: Optional[dict]) -> str:
+    """Classify an item dict as 'healing', 'freeze', 'confusion', or 'other'."""
+    if not item:
+        return "other"
+    itype = str(_g(item, "ItemType", "itemType", default="")).lower()
+    name  = str(_g(item, "Name",     "name",     default="")).lower()
+    eff   = str(_g(item, "Effect",   "effect",   default="")).lower()
+    if "heal"   in itype or "heal"   in name or "heal"   in eff:
+        return "healing"
+    if "freeze" in name  or "freeze" in eff  or "frozen" in name or "frozen" in eff:
+        return "freeze"
+    if "confus" in name  or "confus" in eff  or "dizzy"  in name or "dizzy"  in eff:
+        return "confusion"
+    return "other"
+
+
+def _pickup_priority_score(field_entry: dict, hp_ratio: float) -> int:
+    """Lower = higher priority.
+    0  freeze scroll
+    1  confusion scroll
+    2  monster card
+    3  healing (when HP < HEAL_HP_RATIO)
+    6  healing (HP fine)
+    7  unknown
+    """
+    item = _g(field_entry, "Item", "item")
+    card = _g(field_entry, "MonsterCard", "monsterCard")
+    if item:
+        t = _item_type_label(item)
+        if t == "freeze":    return 0
+        if t == "confusion": return 1
+        if t == "healing":   return 3 if hp_ratio < HEAL_HP_RATIO else 6
+    if card:
+        return 2
+    return 7
+
+
+# ---------------------------------------------------------------------------
+# Map-shrink helpers
+# ---------------------------------------------------------------------------
+
+def _turns_to_next_shrink(turn_count: int) -> int:
+    rem = turn_count % SHRINK_INTERVAL
+    return SHRINK_INTERVAL - rem if rem != 0 else SHRINK_INTERVAL
+
+
+def _is_in_danger_zone(x: int) -> bool:
+    return x <= DANGER_X_LO or x >= DANGER_X_HI
+
+
+# ---------------------------------------------------------------------------
+# GameView
+# ---------------------------------------------------------------------------
 
 class GameView:
-    """Snapshot of the game, post-parsed for decision functions."""
+    """Parsed snapshot of one game tick.
+
+    Extra mutable flags set by the bot after construction:
+        allow_spikes     – treat F_OBSTACLE as walkable (set when carrying heal)
+        rejected_targets – move targets the engine refused this turn
+    """
 
     def __init__(self, state: dict, my_id: int, turn_count: int, tie_seed: int = 0):
-        self.raw = state
-        self.my_id = my_id
+        self.raw        = state
+        self.my_id      = my_id
         self.turn_count = turn_count
-        self.tie_seed = tie_seed
+        self.tie_seed   = tie_seed
+
+        # Routing flags (set by bot after construction)
+        self.allow_spikes: bool = False
+        self.rejected_targets: set = set()
 
         players_dict = _g(state, "Players", "players", default={}) or {}
-        # Players may be keyed by str(id) or int(id)
         players = list(players_dict.values()) if isinstance(players_dict, dict) else list(players_dict)
-        self.me: Optional[dict] = None
+        self.me:    Optional[dict] = None
         self.enemy: Optional[dict] = None
         for p in players:
             if not p:
@@ -198,59 +303,57 @@ class GameView:
                 self.enemy = p
 
         self.map_obj = _g(state, "Map", "map", default={}) or {}
-        self.map_w = int(_g(self.map_obj, "X", "x", default=MAP_W))
-        self.map_h = int(_g(self.map_obj, "Y", "y", default=MAP_H))
-        self.grid: list = _g(self.map_obj, "Grid", "grid", default=[]) or []
+        self.map_w   = int(_g(self.map_obj, "X", "x", default=MAP_W))
+        self.map_h   = int(_g(self.map_obj, "Y", "y", default=MAP_H))
+        self.grid    = _g(self.map_obj, "Grid", "grid", default=[]) or []
 
-        # Build lookup by (x,y) using stored Position when present, fallback to index math.
-        self._field_by_xy: dict[tuple[int, int], dict] = {}
+        self._field_by_xy: dict = {}
         for idx, f in enumerate(self.grid):
             if not isinstance(f, dict):
                 continue
             p = _pos(_g(f, "Position", "position"))
             if p is None:
-                # Reverse engine indexing: Grid[X * map.Y + Y]
                 x = idx // self.map_h
                 y = idx % self.map_h
                 p = (x, y)
             self._field_by_xy[p] = f
 
-        self.monsters: list[dict] = []
-        self.pickups: list[tuple[tuple[int, int], dict]] = []
+        self.monsters: list = []
+        self.pickups:  list = []
         for (x, y), f in self._field_by_xy.items():
             ent = _g(f, "Entity", "entity")
             if ent and isinstance(ent, dict):
-                # JSON $ref entries are back-references to the players defined
-                # elsewhere in the state — they don't have an Id field and
-                # would otherwise be miscounted as monsters.
-                if "$ref" in ent or "$Ref" in ent:
-                    pass
-                else:
+                if "$ref" not in ent and "$Ref" not in ent:
                     eid = _g(ent, "Id", "id")
-                    if eid is not None and eid != my_id and (
-                            self.enemy is None or eid != _g(self.enemy, "Id", "id")):
+                    if (eid is not None
+                            and eid != my_id
+                            and (self.enemy is None or eid != _g(self.enemy, "Id", "id"))):
                         self.monsters.append(ent)
             if _g(f, "Item", "item") or _g(f, "MonsterCard", "monsterCard"):
                 self.pickups.append(((x, y), f))
 
-        # Convenience
-        self.my_pos = _pos(_g(self.me, "Position", "position")) if self.me else None
-        self.enemy_pos = _pos(_g(self.enemy, "Position", "position")) if self.enemy else None
-        self.my_hp = int(_g(self.me, "Health", "health", default=0)) if self.me else 0
-        self.my_max_hp = int(_g(self.me, "MaxHealth", "maxHealth", default=100)) if self.me else 100
-        self.enemy_hp = int(_g(self.enemy, "Health", "health", default=0)) if self.enemy else 0
-        self.my_atk = int(_g(self.me, "AttackPower", "attackPower", default=10)) if self.me else 10
-        self.my_range = int(_g(self.me, "AttackRange", "attackRange", default=1)) if self.me else 1
-        self.my_move = int(_g(self.me, "MaxMoveDistance", "maxMoveDistance", default=4)) if self.me else 4
-        self.my_inventory: list = _g(self.me, "Inventory", "inventory", default=[]) or [] if self.me else []
-        self.my_cards: list = _g(self.me, "Cards", "cards", default=[]) or [] if self.me else []
-        self.my_status: dict = _g(self.me, "ActiveStatuses", "activeStatuses", default={}) or {} if self.me else {}
+        # Shortcuts
+        self.my_pos     = _pos(_g(self.me,    "Position",        "position"))        if self.me    else None
+        self.enemy_pos  = _pos(_g(self.enemy, "Position",        "position"))        if self.enemy else None
+        self.my_hp      = int(_g(self.me,    "Health",          "health",          default=0))   if self.me else 0
+        self.my_max_hp  = int(_g(self.me,    "MaxHealth",       "maxHealth",       default=100)) if self.me else 100
+        self.enemy_hp   = int(_g(self.enemy, "Health",          "health",          default=0))   if self.enemy else 0
+        self.my_atk     = int(_g(self.me,    "AttackPower",     "attackPower",     default=10))  if self.me else 10
+        self.my_range   = int(_g(self.me,    "AttackRange",     "attackRange",     default=1))   if self.me else 1
+        self.my_move    = int(_g(self.me,    "MaxMoveDistance", "maxMoveDistance", default=4))   if self.me else 4
+        self.my_inventory:    list = (_g(self.me,    "Inventory",      "inventory",      default=[]) or []) if self.me    else []
+        self.my_cards:        list = (_g(self.me,    "Cards",          "cards",          default=[]) or []) if self.me    else []
+        self.my_status:       dict = (_g(self.me,    "ActiveStatuses", "activeStatuses", default={}) or {}) if self.me    else {}
+        # Enemy inventory / status — tracked for strategic decisions
+        self.enemy_inventory: list = (_g(self.enemy, "Inventory",      "inventory",      default=[]) or []) if self.enemy else []
+        self.enemy_status:    dict = (_g(self.enemy, "ActiveStatuses", "activeStatuses", default={}) or {}) if self.enemy else {}
 
+    # -----------------------------------------------------------------------
     def field(self, x: int, y: int) -> Optional[dict]:
         return self._field_by_xy.get((x, y))
 
     def field_type(self, x: int, y: int) -> int:
-        f = self.field(x, y)
+        f  = self.field(x, y)
         if not f:
             return F_EMPTY
         ft = _g(f, "FieldType", "fieldType", default=F_EMPTY)
@@ -260,9 +363,15 @@ class GameView:
         return 0 <= x < self.map_w and 0 <= y < self.map_h
 
     def is_walkable(self, x: int, y: int, ignore_entities: bool = False) -> bool:
+        """True if (x,y) can be entered.
+        Ice-spike tiles are allowed only when self.allow_spikes is True
+        (set by the bot when a healing potion is in inventory).
+        """
         if not self.in_bounds(x, y):
             return False
-        if self.field_type(x, y) not in WALKABLE:
+        ft = self.field_type(x, y)
+        walkable = WALKABLE | ({F_OBSTACLE} if self.allow_spikes else set())
+        if ft not in walkable:
             return False
         if not ignore_entities:
             f = self.field(x, y)
@@ -271,128 +380,180 @@ class GameView:
         return True
 
     def has_status(self, name: str) -> bool:
-        if not self.my_status:
-            return False
-        # Status dict may use enum-name keys ("Frozen") or int values
-        for k in self.my_status.keys():
-            if str(k).lower() == name.lower():
-                return True
-        return False
+        return any(str(k).lower() == name.lower() for k in self.my_status.keys())
 
 
-# ─── Geometry / pathfinding ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Item / card finders
+# ---------------------------------------------------------------------------
 
-def manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
+def _find_item_by_type(view: GameView, label: str) -> Optional[dict]:
+    for it in view.my_inventory:
+        if _item_type_label(it) == label:
+            return it
+    return None
+
+def _find_freeze_scroll(view: GameView)    -> Optional[dict]: return _find_item_by_type(view, "freeze")
+def _find_confusion_scroll(view: GameView) -> Optional[dict]: return _find_item_by_type(view, "confusion")
+def _find_healing_item(view: GameView)     -> Optional[dict]: return _find_item_by_type(view, "healing")
+
+def _find_cc_scroll(view: GameView) -> Optional[dict]:
+    """Return freeze scroll first, confusion scroll as fallback."""
+    return _find_freeze_scroll(view) or _find_confusion_scroll(view)
+
+def _find_ice_cube_card(view: GameView) -> Optional[dict]:
+    """Return first ready (non-cooldown) Ice-Cube monster card."""
+    for c in view.my_cards:
+        if bool(_g(c, "OnCooldown", "onCooldown", default=False)):
+            continue
+        mon  = _g(c, "Monster", "monster") or {}
+        name = str(_g(mon, "Name", "name", default="")).lower()
+        if "cube" in name or "ice" in name:
+            return c
+    return None
+
+def _find_any_usable_card(view: GameView) -> Optional[dict]:
+    """Return the highest-attack ready card."""
+    best = None
+    best_atk = -1
+    for c in view.my_cards:
+        if bool(_g(c, "OnCooldown", "onCooldown", default=False)):
+            continue
+        mon = _g(c, "Monster", "monster") or {}
+        atk = int(_g(mon, "AttackPower", "attackPower", default=0) or 0)
+        if atk > best_atk:
+            best_atk = atk
+            best = c
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Enemy status helpers
+# ---------------------------------------------------------------------------
+
+def _enemy_is_frozen(view: GameView) -> bool:
+    return any("frozen" in str(k).lower() for k in view.enemy_status.keys())
+
+def _enemy_is_dizzy(view: GameView) -> bool:
+    return any("dizzy" in str(k).lower() for k in view.enemy_status.keys())
+
+def _enemy_is_cc(view: GameView) -> bool:
+    return _enemy_is_frozen(view) or _enemy_is_dizzy(view)
+
+
+# ---------------------------------------------------------------------------
+# Geometry / pathfinding
+# ---------------------------------------------------------------------------
+
+def manhattan(a, b) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def attack_cells(attacker: dict) -> set[tuple[int, int]]:
-    """Cells the attacker can hit, derived from xPattern/yPattern * AttackRange.
-
-    Pattern offsets are unit directions; each step from 1..AttackRange yields
-    a hit cell. Falls back to 4-neighborhood if pattern arrays are missing.
-    """
+def attack_cells(attacker: dict) -> set:
     pos = _pos(_g(attacker, "Position", "position"))
     if not pos:
         return set()
-    xp = _g(attacker, "xPattern", default=None) or [1, -1, 0, 0]
-    yp = _g(attacker, "yPattern", default=None) or [0, 0, 1, -1]
+    xp  = _g(attacker, "xPattern", default=None) or [1, -1, 0, 0]
+    yp  = _g(attacker, "yPattern", default=None) or [0, 0, 1, -1]
     rng = max(1, int(_g(attacker, "AttackRange", "attackRange", default=1) or 1))
-    cells: set[tuple[int, int]] = set()
+    cells = set()
     for dx, dy in zip(xp, yp):
         for r in range(1, rng + 1):
             cells.add((pos[0] + dx * r, pos[1] + dy * r))
     return cells
 
 
-def reachable_cells(view: GameView, start: tuple[int, int],
-                    max_dist: Optional[int] = None) -> dict[tuple[int, int], int]:
-    """BFS over walkable, entity-free cells. ``max_dist=None`` means unlimited."""
-    seen = {start: 0}
+def reachable_cells(view: GameView, start, max_dist=None) -> dict:
+    seen  = {start: 0}
     queue = [start]
     while queue:
         cur = queue.pop(0)
-        d = seen[cur]
+        d   = seen[cur]
         if max_dist is not None and d >= max_dist:
             continue
         for dx, dy in NEIGHBORS_4:
-            nx, ny = cur[0] + dx, cur[1] + dy
-            if (nx, ny) in seen:
+            nb = (cur[0] + dx, cur[1] + dy)
+            if nb in seen or not view.is_walkable(*nb):
                 continue
-            if not view.is_walkable(nx, ny, ignore_entities=False):
-                continue
-            seen[(nx, ny)] = d + 1
-            queue.append((nx, ny))
+            seen[nb] = d + 1
+            queue.append(nb)
     return seen
 
 
-def bfs_from_goal(view: GameView, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
-    """Distances from ``goal`` to every walkable cell.
-
-    The goal itself may be occupied (e.g. the enemy player) — we still seed
-    the search there so neighbours get distance 1.
-    """
-    seen = {goal: 0}
+def bfs_from_goal(view: GameView, goal) -> dict:
+    """BFS distances from goal to every walkable cell (goal may be occupied)."""
+    seen  = {goal: 0}
     queue = [goal]
     while queue:
         cur = queue.pop(0)
-        d = seen[cur]
+        d   = seen[cur]
         for dx, dy in NEIGHBORS_4:
-            nx, ny = cur[0] + dx, cur[1] + dy
-            if (nx, ny) in seen:
+            nb = (cur[0] + dx, cur[1] + dy)
+            if nb in seen or not view.is_walkable(*nb):
                 continue
-            if not view.is_walkable(nx, ny, ignore_entities=False):
-                continue
-            seen[(nx, ny)] = d + 1
-            queue.append((nx, ny))
+            seen[nb] = d + 1
+            queue.append(nb)
     return seen
 
 
-def single_axis_moves(view: GameView, start: tuple[int, int],
-                      max_dist: int) -> list[tuple[int, int]]:
-    """All legal straight-line move targets from ``start``.
-
-    Slow obstacles are excluded by ``is_walkable`` (see ``WALKABLE`` for the
-    rationale), so every walkable cell costs exactly one move point.
+def single_axis_moves(view: GameView, start, max_dist: int) -> list:
+    """All legal straight-line move targets (engine requires one axis moves).
+    F_OBSTACLE_SLOW (snow) tiles cost 2 movement points; all other walkable
+    tiles cost 1.  Movement stops when the budget would go negative.
+    Additionally, standing ON a snow tile at the start reduces the budget by 1.
+    Server also stops movement at tiles occupied by an Item or MonsterCard.
     """
-    rejected: set[tuple[int, int]] = getattr(view, "rejected_targets", set()) or set()
-    out: list[tuple[int, int]] = []
+    # Already standing on snow costs 1 extra movement point this turn
+    start_penalty = 1 if view.field_type(*start) == F_OBSTACLE_SLOW else 0
+    out = []
     for dx, dy in NEIGHBORS_4:
+        budget = max_dist - start_penalty
         for k in range(1, max_dist + 1):
             cx, cy = start[0] + dx * k, start[1] + dy * k
             if not view.is_walkable(cx, cy):
                 break
-            if (cx, cy) not in rejected:
+            # Server stops movement at tiles with items or monster cards
+            f = view.field(cx, cy)
+            if f and (_g(f, "Item", "item") or _g(f, "MonsterCard", "monsterCard")):
+                break
+            cost = 2 if view.field_type(cx, cy) == F_OBSTACLE_SLOW else 1
+            budget -= cost
+            if budget < 0:
+                break
+            if (cx, cy) not in view.rejected_targets:
                 out.append((cx, cy))
     return out
 
 
-def step_toward(view: GameView, start: tuple[int, int], goal: tuple[int, int],
-                max_dist: int) -> Optional[tuple[int, int]]:
-    """Pick the best legal single-axis move toward ``goal``.
+def step_toward(view: GameView, start, goal, max_dist: int) -> Optional[tuple]:
+    """Pick the best legal single-axis move toward goal.
 
-    The engine only accepts straight-line moves (one of X or Y changes), so
-    we enumerate every (direction, step-length) pair, drop any with a blocked
-    intermediate cell, then rank by BFS path distance to ``goal`` so the bot
-    routes around obstacles instead of stalling in front of them.
+    If no path exists on normal terrain and we carry healing, retries with
+    ice-spike tiles enabled (allow_spikes fallback).
     """
     dist_from_goal = bfs_from_goal(view, goal)
-    big = view.map_w * view.map_h + 1
-    seed = getattr(view, "tie_seed", 0)
+    big  = view.map_w * view.map_h + 1
+    seed = view.tie_seed
 
     candidates = single_axis_moves(view, start, max_dist)
     if not candidates:
+        if not view.allow_spikes and _find_healing_item(view):
+            view.allow_spikes = True
+            result = step_toward(view, start, goal, max_dist)
+            view.allow_spikes = False
+            return result
         return None
 
-    def score(c: tuple[int, int]) -> tuple:
-        d_goal = dist_from_goal.get(c, big + manhattan(c, goal))
-        # Tertiary: per-bot jitter so symmetric self-play doesn't mirror.
-        return (d_goal, hash((c, seed)) & 0xFFFF)
+    def score(c):
+        d = dist_from_goal.get(c, big + manhattan(c, goal))
+        return (d, hash((c, seed)) & 0xFFFF)
 
     return min(candidates, key=score)
 
 
-# ─── Decision functions (priority pipeline) ───────────────────────────────────
+# ---------------------------------------------------------------------------
+# Core predicates
+# ---------------------------------------------------------------------------
 
 def _enemy_in_range(view: GameView) -> bool:
     if not view.me or not view.enemy or not view.enemy_pos:
@@ -403,8 +564,8 @@ def _enemy_in_range(view: GameView) -> bool:
 def _monster_in_range(view: GameView) -> Optional[dict]:
     if not view.me:
         return None
-    cells = attack_cells(view.me)
-    best = None
+    cells   = attack_cells(view.me)
+    best    = None
     best_hp = 10**9
     for m in view.monsters:
         mp = _pos(_g(m, "Position", "position"))
@@ -416,36 +577,29 @@ def _monster_in_range(view: GameView) -> Optional[dict]:
     return best
 
 
+# ---------------------------------------------------------------------------
+# Decision functions
+# ---------------------------------------------------------------------------
+
 def decide_lethal(view: GameView) -> Optional[Action]:
+    """Finish the enemy in one hit."""
     if _enemy_in_range(view) and view.my_atk >= view.enemy_hp > 0:
         return Attack(int(_g(view.enemy, "Id", "id")))
     return None
 
 
-def _find_item(view: GameView, predicate) -> Optional[dict]:
-    for it in view.my_inventory:
-        if predicate(it):
-            return it
-    return None
-
-
 def decide_emergency(view: GameView) -> Optional[Action]:
+    """Heal or retreat when HP is critically low."""
     if not view.me or not view.my_pos:
-        return None
-    if view.my_hp <= 0 or view.my_max_hp <= 0:
         return None
     ratio = view.my_hp / max(1, view.my_max_hp)
     if ratio >= LOW_HP_RATIO:
         return None
-    # 1) Use a healing item if we have one
-    heal = _find_item(view, lambda it: str(_g(it, "ItemType", "itemType", "Effect", default="")).lower() in
-                      ("healing", "heal") or "heal" in str(_g(it, "Effect", "effect", default="")).lower())
-    if heal is not None:
+    heal = _find_healing_item(view)
+    if heal:
         return UseItem(int(_g(heal, "Id", "id")))
-    # 2) Otherwise retreat toward centre, away from enemy
     target = CENTER
     if view.enemy_pos:
-        # mirror across self
         tx = view.my_pos[0] + (view.my_pos[0] - view.enemy_pos[0])
         ty = view.my_pos[1] + (view.my_pos[1] - view.enemy_pos[1])
         target = (max(2, min(view.map_w - 3, tx)), max(2, min(view.map_h - 3, ty)))
@@ -455,26 +609,115 @@ def decide_emergency(view: GameView) -> Optional[Action]:
     return None
 
 
-def decide_edge_safety(view: GameView) -> Optional[Action]:
-    """If standing near shrinking-map dead terrain, retreat inward."""
-    if view.has_status(S_FROZEN):
+def decide_on_tile_pickup(view: GameView) -> Optional[Action]:
+    """Handle being ON an item tile.
+
+    The server's PickupItem/PickupCard only accepts calls when the item is
+    ADJACENT (dist=1) to the player, NOT when the player is standing on it.
+    When we are on the tile we therefore move to a free neighbour so that
+    next turn the item is adjacent and we can pick it up.
+    """
+    if not view.my_pos or not view.pickups:
         return None
-    if not view.my_pos:
+    for (x, y), f in view.pickups:
+        if (x, y) == view.my_pos:
+            # Step off to any free neighbour — item will be adjacent next turn
+            for dx, dy in NEIGHBORS_4:
+                nx, ny = x + dx, y + dy
+                if view.is_walkable(nx, ny):
+                    return Move(nx, ny)
+    return None
+
+
+def decide_adjacent_cc_pickup(view: GameView) -> Optional[Action]:
+    """Pick up a Freeze/Confusion scroll or monster card when adjacent.
+
+    Runs before combat so that high-value items are never skipped because
+    an attack opportunity appeared on the same turn.
+    """
+    if not view.my_pos or not view.pickups:
+        return None
+    hp_ratio = view.my_hp / max(1, view.my_max_hp)
+    for (x, y), f in view.pickups:
+        if _pickup_priority_score(f, hp_ratio) > 2:   # only CC scrolls (0,1) and cards (2)
+            continue
+        if manhattan(view.my_pos, (x, y)) == 1:
+                return Pickup(x, y, f)
+
+
+def decide_zone_trap(view: GameView) -> Optional[Action]:
+    """Freeze/confuse the enemy when they are in the collapsing columns
+    (X <= DANGER_X_LO or X >= DANGER_X_HI) and the shrink is <=2 turns away.
+
+    Freeze preferred (enemy can't walk out); confusion as fallback.
+    Skip if the enemy is already CC'd — the scroll would be wasted.
+    """
+    if not view.enemy_pos:
+        return None
+    ex, _ = view.enemy_pos
+    if not _is_in_danger_zone(ex):
+        return None
+    if _turns_to_next_shrink(view.turn_count) > 2:
+        return None
+    if _enemy_is_cc(view):
+        return None
+    scroll = _find_cc_scroll(view)
+    if scroll:
+        return UseItem(int(_g(scroll, "Id", "id")))
+    return None
+
+
+def decide_zone_safety(view: GameView) -> Optional[Action]:
+    """Enforce time-based X-axis safe zones.
+
+    Turns 1-12 (early game): must stay outside X <= DANGER_X_LO (cols 0-2)
+                              and X >= DANGER_X_HI (cols 29-31).
+    Turns >12 (later):       must leave X <= EXTENDED_DANGER_X_LO (cols 0-5)
+                              and X >= EXTENDED_DANGER_X_HI (cols 26-31)
+                              as those columns will collapse.
+
+    Skipped when frozen (can't move anyway).
+    """
+    if view.has_status(S_FROZEN) or not view.my_pos:
+        return None
+    x, _ = view.my_pos
+
+    if view.turn_count <= EARLY_GAME_TURNS:
+        in_danger = x <= DANGER_X_LO or x >= DANGER_X_HI
+    else:
+        in_danger = x <= EXTENDED_DANGER_X_LO or x >= EXTENDED_DANGER_X_HI
+
+    if not in_danger:
+        return None
+
+    nxt = step_toward(view, view.my_pos, CENTER, view.my_move)
+    if nxt and nxt != view.my_pos:
+        return Move(nxt[0], nxt[1])
+    return None
+
+
+def decide_edge_safety(view: GameView) -> Optional[Action]:
+    """Retreat inward if we are standing near collapsed/collapsing terrain."""
+    if view.has_status(S_FROZEN) or not view.my_pos:
         return None
     x, y = view.my_pos
-    # Count dead-terrain neighbors within 2 cells (radius — covers near edges)
+    # Count dead-or-imminently-collapsing neighbours within radius 2
     dead = 0
     total = 0
+    ttl = _turns_to_next_shrink(view.turn_count)
     for dx in range(-2, 3):
         for dy in range(-2, 3):
             if dx == 0 and dy == 0:
                 continue
             nx, ny = x + dx, y + dy
             total += 1
-            if not view.in_bounds(nx, ny) or view.field_type(nx, ny) in DEAD_TERRAIN:
+            ft = view.field_type(nx, ny) if view.in_bounds(nx, ny) else F_EMPTY
+            if (not view.in_bounds(nx, ny)
+                    or ft in DEAD_TERRAIN
+                    or (_is_in_danger_zone(nx) and ttl <= 1)):
                 dead += 1
-    # Also: am I literally on a vanishing tile?
-    on_dead = view.field_type(x, y) in DEAD_TERRAIN
+    on_dead = (view.field_type(x, y) in DEAD_TERRAIN
+               or (_is_in_danger_zone(x) and ttl <= 1))
     if not on_dead and dead / max(1, total) < 0.45:
         return None
     nxt = step_toward(view, view.my_pos, CENTER, view.my_move)
@@ -483,66 +726,223 @@ def decide_edge_safety(view: GameView) -> Optional[Action]:
     return None
 
 
+def decide_ice_cube_freeze(view: GameView) -> Optional[Action]:
+    """Ice Cube + Freeze combo.
+
+    Step 1 — enemy is free:   freeze them so they can't run.
+    Step 2 — enemy is frozen: summon Ice Cube adjacent to them
+                               (it will attack during MonsterTurn).
+    After the cube is placed we continue attacking via decide_freeze_combo.
+    """
+    if not view.enemy_pos or not view.my_pos:
+        return None
+    ice_card = _find_ice_cube_card(view)
+    if not ice_card:
+        return None
+    if manhattan(view.my_pos, view.enemy_pos) > view.my_move + 4:
+        return None
+
+    if not _enemy_is_frozen(view):
+        freeze = _find_freeze_scroll(view)
+        if freeze:
+            return UseItem(int(_g(freeze, "Id", "id")))
+        return None  # no freeze — can't set up the combo
+
+    # Enemy is frozen — place the cube on the adjacent-to-US tile closest to
+    # the enemy (server only allows summon 1 step from the player, not 1 step
+    # from the enemy).
+    mx, my = view.my_pos
+    best_cell = None
+    best_dist = 10**9
+    for dx, dy in NEIGHBORS_4:
+        sx, sy = mx + dx, my + dy
+        if view.is_walkable(sx, sy):
+            d = manhattan((sx, sy), view.enemy_pos)
+            if d < best_dist:
+                best_dist = d
+                best_cell = (sx, sy)
+    if best_cell:
+        return Summon(int(_g(ice_card, "Id", "id")), best_cell[0], best_cell[1])
+
+    # No free adjacent cell — fall back to attacking the frozen enemy
+    if _enemy_in_range(view):
+        return Attack(int(_g(view.enemy, "Id", "id")))
+    nxt = step_toward(view, view.my_pos, view.enemy_pos, view.my_move)
+    if nxt:
+        return Move(nxt[0], nxt[1])
+    return None
+
+
+def decide_freeze_combo(view: GameView) -> Optional[Action]:
+    """Freeze-and-attack strategy.
+
+    Phase A (enemy frozen):  close in and swing — enemy cannot flee.
+    Phase B (enemy free):    use Freeze Scroll when within striking range,
+                             but only when we don't have an Ice Cube card
+                             ready (let decide_ice_cube_freeze handle that).
+    """
+    if not view.enemy_pos or not view.my_pos:
+        return None
+
+    if _enemy_is_frozen(view):
+        # Enemy can't move — maximise damage
+        if _enemy_in_range(view):
+            return Attack(int(_g(view.enemy, "Id", "id")))
+        nxt = step_toward(view, view.my_pos, view.enemy_pos, view.my_move)
+        if nxt:
+            return Move(nxt[0], nxt[1])
+        return None
+
+    dist  = manhattan(view.my_pos, view.enemy_pos)
+    # Only freeze when we can reach + attack in one turn (truly "close").
+    # Also verify the scroll is actually in inventory before using it.
+    close = view.my_move + view.my_range
+    if dist <= close:
+        # If we also have an ice cube, the richer combo should fire first
+        if not _find_ice_cube_card(view):
+            freeze = _find_freeze_scroll(view)
+            if freeze:  # inventory check: returns None if not carried
+                return UseItem(int(_g(freeze, "Id", "id")))
+    return None
+
+
 def decide_opportunity(view: GameView) -> Optional[Action]:
+    """Attack when in range and strategically worthwhile."""
     if _enemy_in_range(view) and view.enemy_hp > 0:
-        # Attack if it's a meaningful chunk or we can finish quickly
         if view.my_atk * 3 >= view.enemy_hp or view.my_hp > view.enemy_hp:
             return Attack(int(_g(view.enemy, "Id", "id")))
     mon = _monster_in_range(view)
     if mon is not None:
         mhp = int(_g(mon, "Health", "health", default=0))
-        if mhp <= view.my_atk * 2:  # easy kill / xp farm
+        if mhp <= view.my_atk * 2:
             return Attack(int(_g(mon, "Id", "id")))
     return None
 
 
+def decide_contest_pickup(view: GameView) -> Optional[Action]:
+    """Burn a CC scroll when the enemy is racing us to a CC scroll or monster card.
+
+    Triggers when:
+    - The tile holds a CC scroll (score 0-1) or a monster card (score 2).
+    - The enemy is AT LEAST as close to the tile as we are (by actual BFS path).
+    - The enemy is not already CC'd (scroll would be wasted).
+
+    After using the scroll the bot immediately steps toward the tile.
+    """
+    if not view.enemy_pos or not view.my_pos or not view.pickups:
+        return None
+    hp_ratio = view.my_hp / max(1, view.my_max_hp)
+    INF = view.map_w * view.map_h + 1
+
+    # BFS from each position so walls/empty tiles are respected
+    my_bfs    = reachable_cells(view, view.my_pos)
+    enemy_bfs = reachable_cells(view, view.enemy_pos)
+
+    sorted_pus = sorted(view.pickups,
+                        key=lambda p: _pickup_priority_score(p[1], hp_ratio))
+    for (px, py), f in sorted_pus:
+        if _pickup_priority_score(f, hp_ratio) > 3:
+            continue  # only CC scrolls and cards worth contesting
+
+        my_dist    = my_bfs.get((px, py),    INF)
+        enemy_dist = enemy_bfs.get((px, py), INF)
+        if enemy_dist > my_dist:
+            continue  # we are already ahead
+
+        if _enemy_is_cc(view):
+            # Enemy already slowed — sprint to the tile
+            nxt = step_toward(view, view.my_pos, (px, py), view.my_move)
+            if nxt:
+                return Move(nxt[0], nxt[1])
+            return None
+
+        scroll = _find_cc_scroll(view)
+        if scroll:
+            return UseItem(int(_g(scroll, "Id", "id")))
+
+    return None
+
+
 def decide_pickup(view: GameView) -> Optional[Action]:
+    """Pick up items with priority: Freeze > Confusion > Cards > Healing (low HP) > rest.
+
+    Endpoint: PUT /map/pickup/{playerId}/gameId/{gameId}
+              Body: { "Position": { "X": item_x, "Y": item_y } }
+
+    The server accepts a pickup when the player is ON or ADJACENT to the item
+    tile.  We therefore send Pickup(item_pos) in both cases — no need to waste
+    a turn moving onto the tile first.
+
+    Sorting and distance checks use actual BFS distance (not Manhattan) so that
+    walls and empty tiles are respected when choosing which item to chase.
+
+    1. On the pickup tile or adjacent → Pickup(item_x, item_y) immediately.
+    2. Reachable within move budget+1 → Move toward the tile.
+    3. Otherwise                      → walk toward best worthwhile pickup.
+    """
     if not view.my_pos or not view.pickups:
         return None
-    # The engine accepts Pickup only when the player is standing on the cell.
-    for (x, y), f in view.pickups:
-        if (x, y) == view.my_pos:
-            return Pickup(x, y)
-    # If an item is adjacent, step onto it so we can pick it up next turn.
-    for (x, y), f in view.pickups:
-        if manhattan((x, y), view.my_pos) == 1 and view.is_walkable(x, y):
-            return Move(x, y)
+    hp_ratio = view.my_hp / max(1, view.my_max_hp)
+    INF = view.map_w * view.map_h + 1
+
+    # Full BFS from our position — respects walls and empty tiles
+    my_bfs = reachable_cells(view, view.my_pos)
+
+    sorted_pus = sorted(
+        view.pickups,
+        key=lambda pu: (_pickup_priority_score(pu[1], hp_ratio), my_bfs.get(pu[0], INF))
+    )
+
+    # 1) On the tile OR adjacent → pickup directly (saves one turn)
+    #    Manhattan is fine here: two cells that are literally 1 step apart
+    #    are always directly adjacent regardless of other terrain.
+    for (x, y), f in sorted_pus:
+        if manhattan(view.my_pos, (x, y)) <= 1:
+            return Pickup(x, y, f)
+
+    # 2) Within move range by actual BFS path → step toward; pickup next turn
+    for (x, y), f in sorted_pus:
+        if _pickup_priority_score(f, hp_ratio) > 5:
+            continue
+        if my_bfs.get((x, y), INF) <= view.my_move + 1:
+            nxt = step_toward(view, view.my_pos, (x, y), view.my_move)
+            if nxt:
+                return Move(nxt[0], nxt[1])
+
+    # 3) Farther away → walk toward best worthwhile reachable pickup
+    for (x, y), f in sorted_pus:
+        if _pickup_priority_score(f, hp_ratio) > 5:
+            continue
+        if my_bfs.get((x, y), INF) < INF:  # only attempt if actually reachable
+            nxt = step_toward(view, view.my_pos, (x, y), view.my_move)
+            if nxt:
+                return Move(nxt[0], nxt[1])
+
     return None
 
 
 def decide_summon(view: GameView) -> Optional[Action]:
+    """Summon highest-ATK available card on a tile adjacent to the player.
+
+    The server only accepts a summon position that is exactly 1 step (up/down/
+    left/right) from the player.  Among valid adjacent tiles we prefer the one
+    closest to the enemy so the monster can attack quickly.
+    """
     if not view.my_cards or not view.my_pos or not view.enemy_pos:
         return None
-    # Find a non-cooldown card with the highest monster ATK
-    usable = []
-    for c in view.my_cards:
-        on_cd = bool(_g(c, "OnCooldown", "onCooldown", default=False))
-        cd_counter = int(_g(c, "CooldownCounter", "cooldownCounter", default=0) or 0)
-        cd = int(_g(c, "Cooldown", "cooldown", default=0) or 0)
-        if on_cd and cd_counter < cd:
-            continue
-        mon = _g(c, "Monster", "monster") or {}
-        atk = int(_g(mon, "AttackPower", "attackPower", default=0) or 0)
-        usable.append((atk, c))
-    if not usable:
+    card = _find_any_usable_card(view)
+    if not card:
         return None
-    usable.sort(key=lambda t: -t[0])
-    card = usable[0][1]
     card_id = int(_g(card, "Id", "id"))
-    # Try to summon adjacent to enemy (squeeze them)
-    ex, ey = view.enemy_pos
-    candidates: list[tuple[int, int, int]] = []  # (dist_to_enemy, x, y)
+    mx, my  = view.my_pos
+
+    # Only tiles that are exactly 1 step from the player are valid summon spots
+    candidates = []
     for dx, dy in NEIGHBORS_4:
-        sx, sy = ex + dx, ey + dy
+        sx, sy = mx + dx, my + dy
         if view.is_walkable(sx, sy):
-            candidates.append((0, sx, sy))
-    # Otherwise summon adjacent to me (frontline)
-    if not candidates:
-        mx, my = view.my_pos
-        for dx, dy in NEIGHBORS_4:
-            sx, sy = mx + dx, my + dy
-            if view.is_walkable(sx, sy):
-                candidates.append((manhattan((sx, sy), view.enemy_pos), sx, sy))
+            d = manhattan((sx, sy), view.enemy_pos)
+            candidates.append((d, sx, sy))
     if not candidates:
         return None
     candidates.sort()
@@ -551,41 +951,37 @@ def decide_summon(view: GameView) -> Optional[Action]:
 
 
 def decide_powerup(view: GameView) -> Optional[Action]:
+    """Move toward the highest-priority reachable POWERUP tile."""
     if not view.my_pos:
         return None
-    cells = reachable_cells(view, view.my_pos, view.my_move)
-    best: Optional[tuple[int, tuple[int, int]]] = None
+    hp_ratio = view.my_hp / max(1, view.my_max_hp)
+    cells    = reachable_cells(view, view.my_pos, view.my_move)
+    best_score = (99, 99, None)
     for cell, dist in cells.items():
-        if cell == view.my_pos:
+        if cell == view.my_pos or view.field_type(*cell) != F_POWERUP:
             continue
-        if view.field_type(*cell) == F_POWERUP:
-            score = dist  # closer is better
-            if best is None or score < best[0]:
-                best = (score, cell)
-    if best:
-        return Move(best[1][0], best[1][1])
+        f    = view.field(*cell)
+        prio = _pickup_priority_score(f or {}, hp_ratio) if f else 7
+        if (prio, dist) < (best_score[0], best_score[1]):
+            best_score = (prio, dist, cell)
+    if best_score[2] is not None:
+        c = best_score[2]
+        return Move(c[0], c[1])
     return None
 
 
 def decide_pressure(view: GameView) -> Optional[Action]:
-    if view.has_status(S_FROZEN):
+    """Chase the enemy or push them toward the edge in late game."""
+    if view.has_status(S_FROZEN) or not view.my_pos or not view.enemy_pos:
         return None
-    if not view.my_pos or not view.enemy_pos:
-        return None
-
     target = view.enemy_pos
-    # Late game push toward the edge if we're ahead on HP
     if view.turn_count >= LATE_GAME_TURN and view.my_hp > view.enemy_hp:
         ex, ey = view.enemy_pos
-        # Pick the edge closer to enemy, pull them further out
         push_x = 0 if ex < view.map_w // 2 else view.map_w - 1
-        push_y = ey  # bias horizontally; map is wider than tall
-        target = (push_x, push_y)
-
+        target = (push_x, ey)
     nxt = step_toward(view, view.my_pos, target, view.my_move)
     if nxt and nxt != view.my_pos:
         return Move(nxt[0], nxt[1])
-    # Fallback: longest legal straight-line move so we don't stand still.
     moves = single_axis_moves(view, view.my_pos, view.my_move)
     if moves:
         c = max(moves, key=lambda c: manhattan(c, view.my_pos))
@@ -593,77 +989,114 @@ def decide_pressure(view: GameView) -> Optional[Action]:
     return None
 
 
+def _nearest_walkable_to(view: GameView, cx: int, cy: int) -> tuple:
+    """Return the walkable cell nearest to (cx, cy), scanning outward."""
+    if view.is_walkable(cx, cy, ignore_entities=True):
+        return (cx, cy)
+    for r in range(1, max(view.map_w, view.map_h)):
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if abs(dx) == r or abs(dy) == r:
+                    x, y = cx + dx, cy + dy
+                    if view.is_walkable(x, y, ignore_entities=True):
+                        return (x, y)
+    return (cx, cy)
+
+
 def decide_fallback(view: GameView) -> Optional[Action]:
+    """Last resort: move toward centre or any walkable neighbour."""
     if view.has_status(S_FROZEN) or not view.my_pos:
         return None
-    nxt = step_toward(view, view.my_pos, CENTER, view.my_move)
+    goal = _nearest_walkable_to(view, CENTER[0], CENTER[1])
+    nxt = step_toward(view, view.my_pos, goal, view.my_move)
     if nxt and nxt != view.my_pos:
         return Move(nxt[0], nxt[1])
-    # Random walkable neighbor
     rng = random.Random(hash(view.my_pos) & 0xFFFF)
-    options = list(NEIGHBORS_4)
-    rng.shuffle(options)
-    for dx, dy in options:
+    opts = list(NEIGHBORS_4)
+    rng.shuffle(opts)
+    for dx, dy in opts:
         nx, ny = view.my_pos[0] + dx, view.my_pos[1] + dy
-        if view.is_walkable(nx, ny):
+        # ignore_entities=True so an entity-occupied cell is still attempted
+        # rather than returning None and forfeiting the turn
+        if view.is_walkable(nx, ny, ignore_entities=True):
             return Move(nx, ny)
     return None
 
 
+# ---------------------------------------------------------------------------
+# Priority pipeline
+# ---------------------------------------------------------------------------
+
 PRIORITIES = [
-    ("lethal", decide_lethal),
-    ("emergency", decide_emergency),
-    ("edge_safety", decide_edge_safety),
-    ("opportunity", decide_opportunity),
-    ("pickup", decide_pickup),
-    ("summon", decide_summon),
-    ("powerup", decide_powerup),
-    ("pressure", decide_pressure),
-    ("fallback", decide_fallback),
+    # 1. Instant kill
+    ("lethal",               decide_lethal),
+    # 2. Self-preservation
+    ("emergency",            decide_emergency),
+    # 3. Standing ON an item tile — always grab before anything else
+    ("on_tile_pickup",       decide_on_tile_pickup),
+    # 4. Adjacent to a CC scroll / card — grab before combat
+    ("adjacent_cc_pickup",   decide_adjacent_cc_pickup),
+    # 5. Zone trap (time-sensitive — must run before edge_safety)
+    ("zone_trap",            decide_zone_trap),
+    # 6. Proactive time-based X-axis safe zone (early: X>2 and X<29; later: X>5 and X<26)
+    ("zone_safety",          decide_zone_safety),
+    # 7. Escape dying terrain ourselves
+    ("edge_safety",          decide_edge_safety),
+    # 7. Ice Cube + freeze: freeze → summon cube adjacent to frozen enemy
+    ("ice_cube_freeze",      decide_ice_cube_freeze),
+    # 8. Simple freeze → close in → attack cycle
+    ("freeze_combo",         decide_freeze_combo),
+    # 9. Attack when already in range
+    ("opportunity",          decide_opportunity),
+    # 10. Block enemy from grabbing CC scroll / card
+    ("contest_pickup",       decide_contest_pickup),
+    # 11. Pick up remaining items (healing etc.) + approach logic
+    ("pickup",               decide_pickup),
+    # 10. Summon a monster
+    ("summon",          decide_summon),
+    # 11. Move toward a POWERUP tile
+    ("powerup",         decide_powerup),
+    # 12. Chase enemy / late-game edge push
+    ("pressure",        decide_pressure),
+    # 13. Move toward centre / random step
+    ("fallback",        decide_fallback),
 ]
 
 
-# ─── Bot orchestration ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Bot orchestration
+# ---------------------------------------------------------------------------
 
 class MonsterHuntBot:
     def __init__(self, server_url: str, game_id: str, bot_name: str, debug: bool = False):
-        self.bot_name = bot_name
-        self.game_id = game_id
-        self.debug = debug
-        self.player_id: Optional[int] = None
+        self.bot_name   = bot_name
+        self.game_id    = game_id
+        self.debug      = debug
+        self.player_id  = None
         self.turn_count = 0
-        # Stable per-bot seed so symmetric self-play doesn't mirror — used
-        # for path tiebreaks in step_toward via GameView.tie_seed.
-        self._tie_seed = hash(bot_name) & 0xFFFF
-        self.history: list[tuple[int, tuple[int, int], str]] = []
-        # Move targets the engine refused this turn — skipped on retry so we
-        # don't pick the same invalid move again (e.g. an obstacle layout we
-        # mis-modelled). Cleared on phase/turn change.
-        self._rejected_targets: set[tuple[int, int]] = set()
-        self._turn_key: Optional[tuple] = None
-        self.log = self._setup_logger(bot_name)
+        self._tie_seed  = hash(bot_name) & 0xFFFF
+        self.history    = []
+        self._rejected_targets = set()
+        self._turn_key  = None
+        self.log    = self._setup_logger(bot_name)
         self.engine = Engine(server_url, game_id, self.log)
-        # Per-game JSONL dataset file — appended (multiple bots in the same
-        # game share the file; bot_name disambiguates rows).
+
         logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
         os.makedirs(logs_dir, exist_ok=True)
         self.dataset_path = os.path.join(logs_dir, f"{game_id}.txt")
 
-    def _dataset_log(self, state: dict, label: str, action: "Action") -> None:
+    # -----------------------------------------------------------------------
+    def _dataset_log(self, state: dict, label: str, action: Action) -> None:
         record = {
-            "ts": time.time(),
-            "game_id": self.game_id,
-            "bot_name": self.bot_name,
-            "player_id": self.player_id,
+            "ts": time.time(), "game_id": self.game_id,
+            "bot_name": self.bot_name, "player_id": self.player_id,
             "turn": self.turn_count,
             "phase": _g(state, "GameState", "gameState"),
-            "decision": label,
-            "action": action_to_dict(action),
-            "state": state,
+            "decision": label, "action": action_to_dict(action), "state": state,
         }
         try:
-            with open(self.dataset_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+            with open(self.dataset_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
         except OSError as e:
             self.log.warning("dataset log write failed: %s", e)
 
@@ -683,11 +1116,9 @@ class MonsterHuntBot:
 
     def find_my_player_id(self, state: dict) -> bool:
         players = _g(state, "Players", "players", default={}) or {}
-        items = players.values() if isinstance(players, dict) else players
+        items   = players.values() if isinstance(players, dict) else players
         for p in items:
-            if not p:
-                continue
-            if _g(p, "Name", "name") == self.bot_name:
+            if p and _g(p, "Name", "name") == self.bot_name:
                 self.player_id = int(_g(p, "Id", "id"))
                 return True
         return False
@@ -707,20 +1138,22 @@ class MonsterHuntBot:
         if not my:
             return False
         first = bool(_g(my, "First", "first", default=False))
-        gs = _g(state, "GameState", "gameState", default="")
+        gs    = _g(state, "GameState", "gameState", default="")
         return (first and gs == "Player1Turn") or (not first and gs == "Player2Turn")
 
     def is_game_over(self, state: dict) -> bool:
         return bool(state) and _g(state, "GameState", "gameState", default="") == "Ending"
 
+    # -----------------------------------------------------------------------
+
     def _is_stuck(self) -> bool:
         if len(self.history) < ANTI_STUCK_WINDOW:
             return False
-        recent = self.history[-ANTI_STUCK_WINDOW:]
+        recent    = self.history[-ANTI_STUCK_WINDOW:]
         positions = {h[1] for h in recent}
-        actions = {h[2] for h in recent}
-        no_combat = not any(a in ("lethal", "opportunity") for a in actions)
-        # Stuck = bouncing in <=2 cells with no fighting (catches oscillation)
+        actions   = {h[2] for h in recent}
+        no_combat = not any(a in ("lethal", "opportunity", "freeze_combo",
+                                  "ice_cube_freeze", "zone_trap") for a in actions)
         return len(positions) <= 2 and no_combat
 
     def _unstick(self, view: GameView) -> Optional[Action]:
@@ -729,43 +1162,43 @@ class MonsterHuntBot:
         candidates = single_axis_moves(view, view.my_pos, view.my_move)
         if not candidates:
             return None
-        # Pick the farthest legal move biased perpendicular to the enemy
-        # axis so we step *around* whatever obstacle we're stuck on, then
-        # use a per-bot/per-turn jitter to break the symmetry that caused
-        # the loop in the first place.
         mx, my = view.my_pos
         if view.enemy_pos:
-            ex, ey = view.enemy_pos
+            ex, ey     = view.enemy_pos
             horiz_axis = abs(ex - mx) >= abs(ey - my)
         else:
             horiz_axis = True
         seed = (hash(self.bot_name) ^ self.turn_count) & 0xFFFF
 
-        def score(c: tuple[int, int]) -> tuple:
+        def score(c):
             steps = manhattan(c, view.my_pos)
-            perp = abs(c[1] - my) if horiz_axis else abs(c[0] - mx)
+            perp  = abs(c[1] - my) if horiz_axis else abs(c[0] - mx)
             return (-steps, -perp, hash((c, seed)) & 0xFFFF)
 
         candidates.sort(key=score)
         nx, ny = candidates[0]
         return Move(nx, ny)
 
-    def pick_action(self, view: GameView) -> tuple[str, Optional[Action]]:
-        chosen_label = "none"
-        chosen: Optional[Action] = None
+    def pick_action(self, view: GameView):
         if self._is_stuck():
+            # Pickup is always a valid unsticking action — try it first
+            a = decide_pickup(view)
+            if a is not None:
+                return ("pickup", a)
             a = self._unstick(view)
             if a is not None:
                 return ("anti_stuck", a)
         for label, fn in PRIORITIES:
             try:
                 a = fn(view)
-            except Exception as e:  # decision functions must never crash the bot
+            except Exception as e:
                 self.log.exception("decision %s threw: %s", label, e)
                 a = None
             if a is not None:
                 return (label, a)
-        return (chosen_label, chosen)
+        return ("none", None)
+
+    # -----------------------------------------------------------------------
 
     def render_ascii(self, view: GameView) -> str:
         rows = []
@@ -774,18 +1207,12 @@ class MonsterHuntBot:
             for x in range(view.map_w):
                 ch = "."
                 ft = view.field_type(x, y)
-                if ft == F_WALL:
-                    ch = "#"
-                elif ft == F_EMPTY:
-                    ch = " "
-                elif ft == F_OBSTACLE:
-                    ch = "x"
-                elif ft == F_OBSTACLE_SLOW:
-                    ch = "~"
-                elif ft == F_POWERUP:
-                    ch = "+"
-                elif ft == F_BASE:
-                    ch = "B"
+                if ft == F_WALL:           ch = "#"
+                elif ft == F_EMPTY:        ch = " "
+                elif ft == F_OBSTACLE:     ch = "x"
+                elif ft == F_OBSTACLE_SLOW:ch = "~"
+                elif ft == F_POWERUP:      ch = "+"
+                elif ft == F_BASE:         ch = "B"
                 f = view.field(x, y)
                 if f and (_g(f, "Item", "item") or _g(f, "MonsterCard", "monsterCard")):
                     ch = "*"
@@ -802,26 +1229,63 @@ class MonsterHuntBot:
             rows.append("".join(row))
         return "\n".join(rows)
 
+    # -----------------------------------------------------------------------
+
     def take_turn(self, state: dict) -> Optional[dict]:
         self.turn_count += 1
-        # Engine's authoritative turn counter — used for late-game logic so
-        # LATE_GAME_TURN doesn't trigger at half the real game time.
-        game_turn = int(_g(state, "TurnCounter", "turnCounter", default=self.turn_count) or self.turn_count)
-        # Reset per-turn rejection memory whenever the engine actually advances.
+        game_turn = int(_g(state, "TurnCounter", "turnCounter",
+                           default=self.turn_count) or self.turn_count)
+
         turn_key = (game_turn, _g(state, "GameState", "gameState"))
         if turn_key != self._turn_key:
             self._rejected_targets.clear()
             self._turn_key = turn_key
+
         view = GameView(state, self.player_id, game_turn, tie_seed=self._tie_seed)
         view.rejected_targets = self._rejected_targets
+        # Allow spike shortcuts only when we carry a healing potion
+        view.allow_spikes = _find_healing_item(view) is not None
+
         if not view.me or not view.my_pos:
             self.log.warning("no self in state — skipping turn")
             return None
 
         label, action = self.pick_action(view)
+
+        # Absolute last resort — guarantee we always send SOMETHING so the
+        # server doesn't count this turn as a forfeit.
+        if action is None and view.my_pos:
+            for dx, dy in NEIGHBORS_4:
+                nx, ny = view.my_pos[0] + dx, view.my_pos[1] + dy
+                if view.in_bounds(nx, ny):
+                    label, action = "last_resort", Move(nx, ny)
+                    self.log.warning("last_resort fallback: Move(%s,%s)", nx, ny)
+                    break
+
         if action is None:
             self.log.warning("no legal action found — passing")
             return None
+
+        # Remember the intended real-world Move target *before* any inversion.
+        # This is what gets tracked in rejected_targets so pathfinding stays
+        # consistent regardless of whether Dizzy inversion is active.
+        real_move_target: Optional[tuple] = (
+            (action.x, action.y) if isinstance(action, Move) else None
+        )
+
+        # ── Confusion / Dizzy movement inversion ────────────────────────────
+        # When the player is Dizzy the server reverses the movement direction.
+        # To actually reach destination D from position P we must send the
+        # mirror: request = 2*P - D.  This works even for out-of-bounds
+        # values — the server applies the reversal and lands on D.
+        if isinstance(action, Move) and view.has_status(S_DIZZY) and view.my_pos:
+            mx, my = view.my_pos
+            flipped = Move(2 * mx - action.x, 2 * my - action.y)
+            self.log.info(
+                "Dizzy active: want (%s,%s) -> sending (%s,%s)",
+                action.x, action.y, flipped.x, flipped.y,
+            )
+            action = flipped
 
         if self.debug:
             self.log.info("\n%s", self.render_ascii(view))
@@ -829,29 +1293,38 @@ class MonsterHuntBot:
         log_entry = {
             "turn": self.turn_count,
             "phase": _g(state, "GameState", "gameState"),
-            "my_hp": view.my_hp,
-            "enemy_hp": view.enemy_hp,
+            "my_hp": view.my_hp, "enemy_hp": view.enemy_hp,
             "my_pos": list(view.my_pos),
             "enemy_pos": list(view.enemy_pos) if view.enemy_pos else None,
-            "monsters": len(view.monsters),
-            "pickups": len(view.pickups),
+            "enemy_status": list(view.enemy_status.keys()),
+            "enemy_inv": [_item_type_label(it) for it in view.enemy_inventory],
+            "my_inv":    [_item_type_label(it) for it in view.my_inventory],
+            "my_cards":  len(view.my_cards),
+            "monsters":  len(view.monsters),
+            "pickups":   len(view.pickups),
+            "turns_to_shrink":      _turns_to_next_shrink(game_turn),
+            "enemy_in_danger_zone": bool(view.enemy_pos and _is_in_danger_zone(view.enemy_pos[0])),
             "decision": label,
-            "action": action_to_dict(action),
+            "action":   action_to_dict(action),
         }
         self.log.info("%s", json.dumps(log_entry))
         self._dataset_log(state, label, action)
         self.history.append((self.turn_count, view.my_pos, label))
 
+        self._last_action = action
+        # Store the real (pre-inversion) target so rejected_targets always
+        # tracks what we actually wanted to reach, not the flipped request.
+        self._last_real_target: Optional[tuple] = real_move_target
+
         result = self.engine.execute(self.player_id, action)
-        # If the engine refused this Move, remember the target so we don't
-        # re-pick it on the same turn-key. Cleared on phase/turn change.
         if result is None and isinstance(action, Move):
-            self._rejected_targets.add((action.x, action.y))
-            self.log.info("engine rejected Move(%s,%s) — blocking for this turn", action.x, action.y)
+            # Use the real intended target, not the (possibly flipped) request
+            rejected = real_move_target if real_move_target is not None else (action.x, action.y)
+            self._rejected_targets.add(rejected)
+            self.log.info("engine rejected Move, real target (%s,%s)", rejected[0], rejected[1])
         return result
 
     def play(self) -> None:
-        # Bootstrap: wait for game + discover ID
         while True:
             state = self.engine.get_state()
             if state and self.find_my_player_id(state):
@@ -864,12 +1337,10 @@ class MonsterHuntBot:
             while state and not self.is_game_over(state):
                 if self.is_my_turn(state):
                     pre_phase = _g(state, "GameState", "gameState")
-                    pre_turn = _g(state, "TurnCounter", "turnCounter")
+                    pre_turn  = _g(state, "TurnCounter", "turnCounter")
                     self.take_turn(state)
-                    # Block until the engine actually advances past this turn.
-                    # Polling on stale state and re-firing a move is what
-                    # produces the 409 "Action Already Processing" spam.
                     deadline = time.time() + 5.0
+                    state_advanced = False
                     while time.time() < deadline:
                         time.sleep(POLL_INTERVAL)
                         fresh = self.engine.get_state()
@@ -877,91 +1348,172 @@ class MonsterHuntBot:
                             continue
                         state = fresh
                         if self.is_game_over(state):
+                            state_advanced = True
                             break
-                        cur_phase = _g(state, "GameState", "gameState")
-                        cur_turn = _g(state, "TurnCounter", "turnCounter")
-                        if cur_phase != pre_phase or cur_turn != pre_turn:
+                        if (_g(state, "GameState", "gameState") != pre_phase
+                                or _g(state, "TurnCounter", "turnCounter") != pre_turn):
+                            state_advanced = True
                             break
+                    # Server accepted the request (HTTP 200) but didn't advance —
+                    # treat the move target as rejected so we don't retry it.
+                    if not state_advanced:
+                        last      = getattr(self, "_last_action",      None)
+                        last_real = getattr(self, "_last_real_target", None)
+                        if isinstance(last, Move):
+                            # Always track the real (pre-Dizzy-inversion) target
+                            rejected = last_real if last_real is not None else (last.x, last.y)
+                            self._rejected_targets.add(rejected)
+                            self.log.info(
+                                "state unchanged after Move, real target (%s,%s) — marking rejected",
+                                rejected[0], rejected[1],
+                            )
                 else:
                     time.sleep(POLL_INTERVAL)
                     state = self.engine.get_state() or state
         except KeyboardInterrupt:
             self.log.info("stopped by user")
         finally:
-            self.log.info("game over (final phase=%s, turns_played=%s)",
-                          _g(state, "GameState", "gameState") if state else "unknown",
+            self.log.info("game over  phase=%s  turns_played=%s",
+                          _g(state, "GameState", "gameState") if state else "?",
                           self.turn_count)
 
 
-# ─── Sanity unit checks (--test) ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Sanity tests  (--test)
+# ---------------------------------------------------------------------------
+
+def _make_fake_state(my_pos=(5, 5), enemy_pos=(6, 5),
+                     my_hp=100, enemy_hp=100,
+                     my_inv=None, enemy_inv=None,
+                     my_status=None, enemy_status=None) -> dict:
+    my_inv       = my_inv       or []
+    enemy_inv    = enemy_inv    or []
+    my_status    = my_status    or {}
+    enemy_status = enemy_status or {}
+    grid = [{"Position": {"X": x, "Y": y}, "FieldType": F_NORMAL,
+             "Entity": None, "Item": None, "MonsterCard": None}
+            for x in range(MAP_W) for y in range(MAP_H)]
+    return {
+        "GameState": "Player1Turn", "TurnCounter": 1,
+        "Players": {
+            "1": {"Id": 1, "Name": "A", "First": True,
+                  "Health": my_hp, "MaxHealth": 100,
+                  "AttackPower": 10, "AttackRange": 1, "MaxMoveDistance": 4,
+                  "Position": {"X": my_pos[0], "Y": my_pos[1]},
+                  "Inventory": my_inv, "Cards": [],
+                  "ActiveStatuses": my_status,
+                  "xPattern": [1, -1, 0, 0], "yPattern": [0, 0, 1, -1]},
+            "2": {"Id": 2, "Name": "B", "First": False,
+                  "Health": enemy_hp, "MaxHealth": 100,
+                  "AttackPower": 10, "AttackRange": 1, "MaxMoveDistance": 4,
+                  "Position": {"X": enemy_pos[0], "Y": enemy_pos[1]},
+                  "Inventory": enemy_inv, "Cards": [],
+                  "ActiveStatuses": enemy_status,
+                  "xPattern": [1, -1, 0, 0], "yPattern": [0, 0, 1, -1]},
+        },
+        "Map": {"X": MAP_W, "Y": MAP_H, "Name": "test", "Grid": grid},
+    }
+
 
 def run_tests() -> int:
     print("running sanity checks...")
+
     assert manhattan((0, 0), (3, 4)) == 7
     assert manhattan((1, 1), (1, 1)) == 0
 
-    fake = {
-        "GameState": "Player1Turn",
-        "Players": {
-            "1": {"Id": 1, "Name": "A", "First": True, "Health": 100, "MaxHealth": 100,
-                  "AttackPower": 10, "AttackRange": 1, "MaxMoveDistance": 4,
-                  "Position": {"X": 5, "Y": 5}, "Inventory": [], "Cards": [],
-                  "ActiveStatuses": {}, "xPattern": [1, -1, 0, 0], "yPattern": [0, 0, 1, -1]},
-            "2": {"Id": 2, "Name": "B", "First": False, "Health": 5, "MaxHealth": 100,
-                  "AttackPower": 10, "AttackRange": 1, "MaxMoveDistance": 4,
-                  "Position": {"X": 6, "Y": 5}, "Inventory": [], "Cards": [],
-                  "ActiveStatuses": {}, "xPattern": [1, -1, 0, 0], "yPattern": [0, 0, 1, -1]},
-        },
-        "Map": {
-            "X": MAP_W, "Y": MAP_H, "Name": "test",
-            "Grid": [{"Position": {"X": x, "Y": y}, "FieldType": F_NORMAL,
-                      "Entity": None, "Item": None, "MonsterCard": None}
-                     for x in range(MAP_W) for y in range(MAP_H)],
-        },
-    }
-    view = GameView(fake, my_id=1, turn_count=1)
-    assert view.my_pos == (5, 5), view.my_pos
-    assert view.enemy_pos == (6, 5), view.enemy_pos
+    # --- Basic view ---
+    state = _make_fake_state()
+    view  = GameView(state, my_id=1, turn_count=1)
+    assert view.my_pos    == (5, 5)
+    assert view.enemy_pos == (6, 5)
     assert view.field_type(0, 0) == F_NORMAL
     assert view.is_walkable(10, 10)
 
-    # Lethal: enemy adjacent with 5 HP, ATK 10 → attack
-    a = decide_lethal(view)
+    # --- Lethal ---
+    v2 = GameView(_make_fake_state(enemy_hp=5), my_id=1, turn_count=1)
+    a  = decide_lethal(v2)
     assert isinstance(a, Attack) and a.target_id == 2, a
 
-    # Step toward goal beyond move range
+    # --- Step toward ---
     nxt = step_toward(view, (5, 5), (15, 5), 4)
-    assert nxt and manhattan(nxt, (15, 5)) < manhattan((5, 5), (15, 5)), nxt
+    assert nxt and manhattan(nxt, (15, 5)) < manhattan((5, 5), (15, 5))
 
-    # Action JSON serialisation
-    assert action_to_dict(Move(1, 2)) == {"type": "Move", "x": 1, "y": 2}
+    # --- Action dicts ---
+    assert action_to_dict(Move(1, 2))     == {"type": "Move",   "x": 1, "y": 2}
     assert action_to_dict(Pickup(3, 4))["type"] == "Pickup"
     assert action_to_dict(Summon(7, 1, 2))["card"] == 7
 
-    # Pickup detection
-    fake2 = json.loads(json.dumps(fake))
-    fake2["Map"]["Grid"][5 * MAP_H + 5]["Item"] = {"Id": 99, "Name": "Heal", "ItemType": 1}
-    view2 = GameView(fake2, my_id=1, turn_count=1)
-    assert any(p[0] == (5, 5) for p in view2.pickups)
-    pa = decide_pickup(view2)
-    assert isinstance(pa, Pickup) and (pa.x, pa.y) == (5, 5), pa
+    # --- Zone trap ---
+    freeze_item = {"Id": 99, "Name": "Freeze Scroll", "ItemType": "CrowdControl",
+                   "Effect": "freeze", "Uses": 1}
+    s3 = _make_fake_state(enemy_pos=(1, 8), my_inv=[freeze_item])
+    s3["TurnCounter"] = 13   # 15 - 13 = 2 turns to shrink
+    v3 = GameView(s3, my_id=1, turn_count=13)
+    a3 = decide_zone_trap(v3)
+    assert isinstance(a3, UseItem) and a3.item_id == 99, a3
+
+    # --- Contest pickup ---
+    freeze_item2 = {"Id": 99, "Name": "Freeze Scroll", "ItemType": "CrowdControl",
+                    "Effect": "freeze", "Uses": 1}
+    s4 = _make_fake_state(my_pos=(5, 5), enemy_pos=(15, 5), my_inv=[freeze_item2])
+    # Place a freeze scroll equidistant at (10, 5)
+    for f in s4["Map"]["Grid"]:
+        if f["Position"] == {"X": 10, "Y": 5}:
+            f["Item"] = {"Id": 77, "Name": "Freeze Scroll", "ItemType": "CrowdControl",
+                         "Effect": "freeze"}
+    v4 = GameView(s4, my_id=1, turn_count=1)
+    a4 = decide_contest_pickup(v4)
+    assert isinstance(a4, UseItem), f"expected UseItem, got {a4}"
+
+    # --- Pickup priority scoring ---
+    heal_item = {"Id": 50, "Name": "Healing Potion", "ItemType": "Healing", "Effect": "heal"}
+    conf_item = {"Id": 51, "Name": "Confusion Scroll", "ItemType": "CrowdControl", "Effect": "confusion"}
+    assert _pickup_priority_score({"Item": freeze_item}, 1.0) == 0
+    assert _pickup_priority_score({"Item": conf_item},   1.0) == 1
+    assert _pickup_priority_score({"MonsterCard": {"Id": 1, "Name": "IceCube"}}, 1.0) == 2
+    assert _pickup_priority_score({"Item": heal_item},   0.2) == 3
+    assert _pickup_priority_score({"Item": heal_item},   1.0) == 6
+
+    # --- Snow walkable, spikes not (without healing) ---
+    s5 = _make_fake_state()
+    for f in s5["Map"]["Grid"]:
+        if f["Position"] == {"X": 3, "Y": 3}: f["FieldType"] = F_OBSTACLE_SLOW
+        if f["Position"] == {"X": 4, "Y": 4}: f["FieldType"] = F_OBSTACLE
+    v5 = GameView(s5, my_id=1, turn_count=1)
+    assert v5.is_walkable(3, 3),      "snow must be walkable"
+    assert not v5.is_walkable(4, 4),  "spike not walkable without heal"
+    v5.allow_spikes = True
+    assert v5.is_walkable(4, 4),      "spike walkable with allow_spikes"
+
+    # --- Shrink helpers ---
+    assert _turns_to_next_shrink(1)  == 14
+    assert _turns_to_next_shrink(14) == 1
+    assert _turns_to_next_shrink(15) == 15
+    assert _turns_to_next_shrink(16) == 14
+    assert _is_in_danger_zone(0)
+    assert _is_in_danger_zone(2)
+    assert not _is_in_danger_zone(3)
+    assert not _is_in_danger_zone(28)
+    assert _is_in_danger_zone(29)
+    assert _is_in_danger_zone(31)
 
     print("OK — all sanity checks passed.")
     return 0
 
 
-# ─── main ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     if "--test" in sys.argv:
         return run_tests()
     if len(sys.argv) < 4:
-        print("Usage: python bot_template_py.py <server_url> <game_id> <bot_name> [--debug]")
+        print("Usage: python ivan_bot.py <server_url> <game_id> <bot_name> [--debug]")
         return 1
     server_url, game_id, bot_name = sys.argv[1], sys.argv[2], sys.argv[3]
     debug = "--debug" in sys.argv
-    bot = MonsterHuntBot(server_url, game_id, bot_name, debug=debug)
-    bot.play()
+    MonsterHuntBot(server_url, game_id, bot_name, debug=debug).play()
     return 0
 
 
