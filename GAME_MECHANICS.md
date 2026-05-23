@@ -74,14 +74,14 @@ From `Item` model:
 - `Duration` (int?) — effect duration (nullable).
 - `ItemType` (enum `ItemType`) — category.
 
-`ItemType` values (from `ItemType` enum) and examples:
+`ItemType` values (from `ItemType` enum):
 - `None`
-- `Healing` — e.g., health crystal (heals).
-- `Movement` — e.g., wind boots, teleport stone (movement effects).
-- `Defense` — e.g., invisibility cloak (defensive buffs).
-- `Utility` — e.g., XP/material gatherers (collecting).
-- `CrowdControl` — e.g., freezing powder (slows / disables enemies).
-- `Attack` — e.g., damage-boosting items (weapons).
+- `Healing` — Healing Potion (+50 HP).
+- `CrowdControl` — Confusion Scroll (2 turns Dizzy), Freeze Scroll (2 turns Frozen).
+- `Movement`
+- `Defense`
+- `Utility`
+- `Attack`
 
 Implementer note: Item fields are nullable where optional; check `Uses` and `Duration` before using.
 
@@ -175,5 +175,5 @@ Usage:
 - Track cooldowns (monster cards, obstacles) explicitly in your bot (server provides counters; apply per-turn decrement logic in your agent to mirror server semantics).
 - Respect `ActiveStatuses` durations: decrement per-turn and apply movement/attack restrictions based on status type (`Fatigue`, `Frozen`, `Dizzy`).
 
---- 
+---
 Keep this doc next to your bot code for quick reference to model fields, endpoint usage, and edge-case behaviors (notably `Obstacle.IsOnCooldown()` and `MonsterCard` cooldown counters).
