@@ -1,6 +1,6 @@
 """Shared strategy helpers used by `final.py`."""
 from game_api import is_card, tile_position, _get
-from pathfinding import reachable, distance
+from pathfinding import distance
 
 
 def grab_or_approach(bot, me, world, target, log, within=None):
@@ -29,9 +29,19 @@ def summon_monster(bot, me, enemy, center, safe, log, within=None):
     cards = [card for card in (me.cards or []) if ready_monster_card(card)]
     if not cards:
         return False
-    tiles = reachable(me, turns=1)
-    if within is not None:
-        tiles = {p for p in tiles if within(p)}
+    world = bot.map
+    x, y = me.position
+    tiles = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        pos = (x + dx, y + dy)
+        if world is None or not world.in_bounds(pos):
+            continue
+        tile = world.tile_at(pos)
+        if tile is None or world.get_entity_at(pos) is not None:
+            continue
+        if within is not None and not within(pos):
+            continue
+        tiles.append(pos)
     if not tiles:
         return False
     goal = enemy.position if enemy and enemy.position and safe(enemy.position) else center
@@ -46,8 +56,7 @@ def summon_monster(bot, me, enemy, center, safe, log, within=None):
     )
     card = cards[0]
     log("action: summon monster", _get(card, "Name", "name"), pos)
-    bot.summon(card, pos)
-    return True
+    return bool(bot.summon(card, pos))
 
 
 def pickup_on_route(me, center, tile):

@@ -135,8 +135,14 @@ def run(bot, poll=1.0, pace=0.2):
     `pace` throttles every action so we never hammer the server."""
     state = bot.get_game_state()
     last = time.monotonic()
+    last_processed_turn = None
     while state and not bot.is_game_over(state):
+        turn_key = _turn_key(state)
         if bot.is_my_turn(state):
+            if turn_key == last_processed_turn:
+                time.sleep(poll)
+                state = bot.get_game_state()
+                continue
             bot.update(state)
             now = time.monotonic()
             if DEBUG:
@@ -148,9 +154,11 @@ def run(bot, poll=1.0, pace=0.2):
             except Exception as e:          # never let one bad turn kill the bot
                 print("decide() error:", e, flush=True)
                 bot.save_state("bot_error_state.json")
+            last_processed_turn = turn_key
             time.sleep(pace)                 # pace the game + never hammer the server
             state = bot.get_game_state()     # turn normally advanced → now the opponent's
         else:
+            last_processed_turn = None
             time.sleep(poll)
             state = bot.get_game_state()
 

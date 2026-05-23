@@ -30,6 +30,9 @@ class Bot:
         self.me = None
         self.enemy = None
         self.map = None
+        # Last action response/state and status code (used to avoid extra GETs)
+        self._last_action_state = None
+        self._last_action_status = None
         # The "No-UI" header marks us as a bot: the server then skips its 2s
         # per-action UI delay and returns immediately instead of long-polling
         # 30s (which otherwise fails with "Other player didn't make a move").
@@ -116,13 +119,24 @@ class Bot:
             resp = self._http.put(url, json=body, timeout=self.ACTION_TIMEOUT)
         except requests.RequestException as e:
             print("Request failed:", e)
+            self._last_action_state = None
+            self._last_action_status = None
             return None
         if resp.status_code != 200:
             print(f"Action rejected ({resp.status_code}): {resp.text[:200]}")
+            self._last_action_state = None
+            self._last_action_status = resp.status_code
             return None
         try:
-            return resp.json()
+            data = resp.json()
+            # record the returned canonical game state so the caller can avoid
+            # an immediate GET and reduce polling churn
+            self._last_action_state = data
+            self._last_action_status = resp.status_code
+            return data
         except ValueError:
+            self._last_action_state = None
+            self._last_action_status = resp.status_code
             return None
 
     # ── actions ────────────────────────────────────────────────────────────
@@ -133,6 +147,19 @@ class Bot:
 
     def move(self, pos):
         x, y = _pos(pos)
+        # Dizzy compensation: the server inverts our movement vector (sends us in the
+        # opposite direction), so we pre-invert the destination so we still arrive where
+        # we actually want to go.  Formula: anti_target = 2*current - intended_target.
+        # The server then does 2*current - anti_target = intended_target ✓.
+        if self.me and self.me.has_status("Dizzy"):
+            mx, my = self.me.position
+            map_w = (self.map.width  if self.map else 32) - 1
+            map_h = (self.map.height if self.map else 16) - 1
+            ax = max(0, min(map_w, 2 * mx - x))
+            ay = max(0, min(map_h, 2 * my - y))
+            print(f"[BOT] Dizzy active — sending anti-target ({ax},{ay}) to reach ({x},{y})",
+                  flush=True)
+            x, y = ax, ay
         url = f"{self.server_url}/player/move/gameId/{self.game_id}"
         return self._put(url, {"playerId": self.player_id, "newPosition": {"X": x, "Y": y}})
 
