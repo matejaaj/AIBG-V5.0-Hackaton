@@ -42,8 +42,12 @@ F_POWERUP = 4
 F_WALL = 5
 F_EMPTY = 6
 
-WALKABLE = {F_BASE, F_NORMAL, F_OBSTACLE_SLOW, F_POWERUP}
-DEAD_TERRAIN = {F_WALL, F_EMPTY, F_OBSTACLE}
+# Slow obstacles are technically walkable for the engine (cost 2), but
+# empirically once a player ENDS a move on one, every move attempt the
+# next turn is rejected with no status flag set. We therefore treat them
+# as non-walkable so the bot routes around them entirely.
+WALKABLE = {F_BASE, F_NORMAL, F_POWERUP}
+DEAD_TERRAIN = {F_WALL, F_EMPTY, F_OBSTACLE, F_OBSTACLE_SLOW}
 
 # Status enum from Models/Enums/Status.cs
 S_FROZEN = "Frozen"
@@ -105,7 +109,11 @@ class Engine:
 
     def _req(self, method: str, path: str, body: Optional[dict] = None) -> Optional[dict]:
         url = f"{self.url}{path}"
-        for attempt in (1, 2):
+        # Mutating endpoints must not auto-retry: a retry after a server-side
+        # "Not your turn" can re-submit the move on the *next* phase and
+        # corrupt our turn (we saw this produce 500/409 spam).
+        attempts = (1,) if method != "GET" else (1, 2)
+        for attempt in attempts:
             try:
                 r = requests.request(method, url, json=body, timeout=HTTP_TIMEOUT)
                 if 200 <= r.status_code < 300:
@@ -114,8 +122,8 @@ class Engine:
                     except ValueError:
                         return {"_raw": r.text}
                 self.log.warning("HTTP %s %s -> %s body=%s", method, path, r.status_code, r.text[:200])
-                if 400 <= r.status_code < 500:
-                    return None  # client error — retry won't help
+                if 400 <= r.status_code < 600:
+                    return None  # client/server error — retry won't help on a turn action
             except requests.RequestException as e:
                 self.log.warning("HTTP %s %s attempt %s failed: %s", method, path, attempt, e)
             time.sleep(0.1)
@@ -169,10 +177,11 @@ def _pos(p: Optional[dict]) -> Optional[tuple[int, int]]:
 class GameView:
     """Snapshot of the game, post-parsed for decision functions."""
 
-    def __init__(self, state: dict, my_id: int, turn_count: int):
+    def __init__(self, state: dict, my_id: int, turn_count: int, tie_seed: int = 0):
         self.raw = state
         self.my_id = my_id
         self.turn_count = turn_count
+        self.tie_seed = tie_seed
 
         players_dict = _g(state, "Players", "players", default={}) or {}
         # Players may be keyed by str(id) or int(id)
@@ -211,10 +220,16 @@ class GameView:
         for (x, y), f in self._field_by_xy.items():
             ent = _g(f, "Entity", "entity")
             if ent and isinstance(ent, dict):
-                eid = _g(ent, "Id", "id")
-                # Monsters: Entity that isn't either player
-                if eid != my_id and (self.enemy is None or eid != _g(self.enemy, "Id", "id")):
-                    self.monsters.append(ent)
+                # JSON $ref entries are back-references to the players defined
+                # elsewhere in the state — they don't have an Id field and
+                # would otherwise be miscounted as monsters.
+                if "$ref" in ent or "$Ref" in ent:
+                    pass
+                else:
+                    eid = _g(ent, "Id", "id")
+                    if eid is not None and eid != my_id and (
+                            self.enemy is None or eid != _g(self.enemy, "Id", "id")):
+                        self.monsters.append(ent)
             if _g(f, "Item", "item") or _g(f, "MonsterCard", "monsterCard"):
                 self.pickups.append(((x, y), f))
 
@@ -290,14 +305,15 @@ def attack_cells(attacker: dict) -> set[tuple[int, int]]:
     return cells
 
 
-def reachable_cells(view: GameView, start: tuple[int, int], max_dist: int) -> dict[tuple[int, int], int]:
-    """BFS within max_dist Manhattan steps over walkable, entity-free cells."""
+def reachable_cells(view: GameView, start: tuple[int, int],
+                    max_dist: Optional[int] = None) -> dict[tuple[int, int], int]:
+    """BFS over walkable, entity-free cells. ``max_dist=None`` means unlimited."""
     seen = {start: 0}
     queue = [start]
     while queue:
         cur = queue.pop(0)
         d = seen[cur]
-        if d >= max_dist:
+        if max_dist is not None and d >= max_dist:
             continue
         for dx, dy in NEIGHBORS_4:
             nx, ny = cur[0] + dx, cur[1] + dy
@@ -310,16 +326,70 @@ def reachable_cells(view: GameView, start: tuple[int, int], max_dist: int) -> di
     return seen
 
 
+def bfs_from_goal(view: GameView, goal: tuple[int, int]) -> dict[tuple[int, int], int]:
+    """Distances from ``goal`` to every walkable cell.
+
+    The goal itself may be occupied (e.g. the enemy player) — we still seed
+    the search there so neighbours get distance 1.
+    """
+    seen = {goal: 0}
+    queue = [goal]
+    while queue:
+        cur = queue.pop(0)
+        d = seen[cur]
+        for dx, dy in NEIGHBORS_4:
+            nx, ny = cur[0] + dx, cur[1] + dy
+            if (nx, ny) in seen:
+                continue
+            if not view.is_walkable(nx, ny, ignore_entities=False):
+                continue
+            seen[(nx, ny)] = d + 1
+            queue.append((nx, ny))
+    return seen
+
+
+def single_axis_moves(view: GameView, start: tuple[int, int],
+                      max_dist: int) -> list[tuple[int, int]]:
+    """All legal straight-line move targets from ``start``.
+
+    Slow obstacles are excluded by ``is_walkable`` (see ``WALKABLE`` for the
+    rationale), so every walkable cell costs exactly one move point.
+    """
+    rejected: set[tuple[int, int]] = getattr(view, "rejected_targets", set()) or set()
+    out: list[tuple[int, int]] = []
+    for dx, dy in NEIGHBORS_4:
+        for k in range(1, max_dist + 1):
+            cx, cy = start[0] + dx * k, start[1] + dy * k
+            if not view.is_walkable(cx, cy):
+                break
+            if (cx, cy) not in rejected:
+                out.append((cx, cy))
+    return out
+
+
 def step_toward(view: GameView, start: tuple[int, int], goal: tuple[int, int],
                 max_dist: int) -> Optional[tuple[int, int]]:
-    """Pick the reachable cell that minimises Manhattan distance to goal."""
-    cells = reachable_cells(view, start, max_dist)
-    if not cells:
-        return None
-    candidates = [c for c in cells if c != start]
+    """Pick the best legal single-axis move toward ``goal``.
+
+    The engine only accepts straight-line moves (one of X or Y changes), so
+    we enumerate every (direction, step-length) pair, drop any with a blocked
+    intermediate cell, then rank by BFS path distance to ``goal`` so the bot
+    routes around obstacles instead of stalling in front of them.
+    """
+    dist_from_goal = bfs_from_goal(view, goal)
+    big = view.map_w * view.map_h + 1
+    seed = getattr(view, "tie_seed", 0)
+
+    candidates = single_axis_moves(view, start, max_dist)
     if not candidates:
         return None
-    return min(candidates, key=lambda c: (manhattan(c, goal), -cells[c]))
+
+    def score(c: tuple[int, int]) -> tuple:
+        d_goal = dist_from_goal.get(c, big + manhattan(c, goal))
+        # Tertiary: per-bot jitter so symmetric self-play doesn't mirror.
+        return (d_goal, hash((c, seed)) & 0xFFFF)
+
+    return min(candidates, key=score)
 
 
 # ─── Decision functions (priority pipeline) ───────────────────────────────────
@@ -429,14 +499,14 @@ def decide_opportunity(view: GameView) -> Optional[Action]:
 def decide_pickup(view: GameView) -> Optional[Action]:
     if not view.my_pos or not view.pickups:
         return None
-    # Prefer pickups we already stand on
+    # The engine accepts Pickup only when the player is standing on the cell.
     for (x, y), f in view.pickups:
         if (x, y) == view.my_pos:
             return Pickup(x, y)
-    # Then adjacent ones
+    # If an item is adjacent, step onto it so we can pick it up next turn.
     for (x, y), f in view.pickups:
-        if manhattan((x, y), view.my_pos) <= 1:
-            return Pickup(x, y)
+        if manhattan((x, y), view.my_pos) == 1 and view.is_walkable(x, y):
+            return Move(x, y)
     return None
 
 
@@ -515,6 +585,11 @@ def decide_pressure(view: GameView) -> Optional[Action]:
     nxt = step_toward(view, view.my_pos, target, view.my_move)
     if nxt and nxt != view.my_pos:
         return Move(nxt[0], nxt[1])
+    # Fallback: longest legal straight-line move so we don't stand still.
+    moves = single_axis_moves(view, view.my_pos, view.my_move)
+    if moves:
+        c = max(moves, key=lambda c: manhattan(c, view.my_pos))
+        return Move(c[0], c[1])
     return None
 
 
@@ -553,12 +628,44 @@ PRIORITIES = [
 class MonsterHuntBot:
     def __init__(self, server_url: str, game_id: str, bot_name: str, debug: bool = False):
         self.bot_name = bot_name
+        self.game_id = game_id
         self.debug = debug
         self.player_id: Optional[int] = None
         self.turn_count = 0
+        # Stable per-bot seed so symmetric self-play doesn't mirror — used
+        # for path tiebreaks in step_toward via GameView.tie_seed.
+        self._tie_seed = hash(bot_name) & 0xFFFF
         self.history: list[tuple[int, tuple[int, int], str]] = []
+        # Move targets the engine refused this turn — skipped on retry so we
+        # don't pick the same invalid move again (e.g. an obstacle layout we
+        # mis-modelled). Cleared on phase/turn change.
+        self._rejected_targets: set[tuple[int, int]] = set()
+        self._turn_key: Optional[tuple] = None
         self.log = self._setup_logger(bot_name)
         self.engine = Engine(server_url, game_id, self.log)
+        # Per-game JSONL dataset file — appended (multiple bots in the same
+        # game share the file; bot_name disambiguates rows).
+        logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        self.dataset_path = os.path.join(logs_dir, f"{game_id}.txt")
+
+    def _dataset_log(self, state: dict, label: str, action: "Action") -> None:
+        record = {
+            "ts": time.time(),
+            "game_id": self.game_id,
+            "bot_name": self.bot_name,
+            "player_id": self.player_id,
+            "turn": self.turn_count,
+            "phase": _g(state, "GameState", "gameState"),
+            "decision": label,
+            "action": action_to_dict(action),
+            "state": state,
+        }
+        try:
+            with open(self.dataset_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError as e:
+            self.log.warning("dataset log write failed: %s", e)
 
     @staticmethod
     def _setup_logger(name: str) -> logging.Logger:
@@ -612,20 +719,36 @@ class MonsterHuntBot:
         recent = self.history[-ANTI_STUCK_WINDOW:]
         positions = {h[1] for h in recent}
         actions = {h[2] for h in recent}
-        # All same position and never attacked = stuck
-        return len(positions) == 1 and not any(a == "lethal" or a == "opportunity" for a in actions)
+        no_combat = not any(a in ("lethal", "opportunity") for a in actions)
+        # Stuck = bouncing in <=2 cells with no fighting (catches oscillation)
+        return len(positions) <= 2 and no_combat
 
     def _unstick(self, view: GameView) -> Optional[Action]:
         if not view.my_pos:
             return None
-        rng = random.Random(self.turn_count * 7919 + 17)
-        options = list(NEIGHBORS_4)
-        rng.shuffle(options)
-        for dx, dy in options:
-            nx, ny = view.my_pos[0] + dx, view.my_pos[1] + dy
-            if view.is_walkable(nx, ny):
-                return Move(nx, ny)
-        return None
+        candidates = single_axis_moves(view, view.my_pos, view.my_move)
+        if not candidates:
+            return None
+        # Pick the farthest legal move biased perpendicular to the enemy
+        # axis so we step *around* whatever obstacle we're stuck on, then
+        # use a per-bot/per-turn jitter to break the symmetry that caused
+        # the loop in the first place.
+        mx, my = view.my_pos
+        if view.enemy_pos:
+            ex, ey = view.enemy_pos
+            horiz_axis = abs(ex - mx) >= abs(ey - my)
+        else:
+            horiz_axis = True
+        seed = (hash(self.bot_name) ^ self.turn_count) & 0xFFFF
+
+        def score(c: tuple[int, int]) -> tuple:
+            steps = manhattan(c, view.my_pos)
+            perp = abs(c[1] - my) if horiz_axis else abs(c[0] - mx)
+            return (-steps, -perp, hash((c, seed)) & 0xFFFF)
+
+        candidates.sort(key=score)
+        nx, ny = candidates[0]
+        return Move(nx, ny)
 
     def pick_action(self, view: GameView) -> tuple[str, Optional[Action]]:
         chosen_label = "none"
@@ -681,7 +804,16 @@ class MonsterHuntBot:
 
     def take_turn(self, state: dict) -> Optional[dict]:
         self.turn_count += 1
-        view = GameView(state, self.player_id, self.turn_count)
+        # Engine's authoritative turn counter — used for late-game logic so
+        # LATE_GAME_TURN doesn't trigger at half the real game time.
+        game_turn = int(_g(state, "TurnCounter", "turnCounter", default=self.turn_count) or self.turn_count)
+        # Reset per-turn rejection memory whenever the engine actually advances.
+        turn_key = (game_turn, _g(state, "GameState", "gameState"))
+        if turn_key != self._turn_key:
+            self._rejected_targets.clear()
+            self._turn_key = turn_key
+        view = GameView(state, self.player_id, game_turn, tie_seed=self._tie_seed)
+        view.rejected_targets = self._rejected_targets
         if not view.me or not view.my_pos:
             self.log.warning("no self in state — skipping turn")
             return None
@@ -707,9 +839,16 @@ class MonsterHuntBot:
             "action": action_to_dict(action),
         }
         self.log.info("%s", json.dumps(log_entry))
+        self._dataset_log(state, label, action)
         self.history.append((self.turn_count, view.my_pos, label))
 
-        return self.engine.execute(self.player_id, action)
+        result = self.engine.execute(self.player_id, action)
+        # If the engine refused this Move, remember the target so we don't
+        # re-pick it on the same turn-key. Cleared on phase/turn change.
+        if result is None and isinstance(action, Move):
+            self._rejected_targets.add((action.x, action.y))
+            self.log.info("engine rejected Move(%s,%s) — blocking for this turn", action.x, action.y)
+        return result
 
     def play(self) -> None:
         # Bootstrap: wait for game + discover ID
@@ -724,9 +863,25 @@ class MonsterHuntBot:
         try:
             while state and not self.is_game_over(state):
                 if self.is_my_turn(state):
-                    new_state = self.take_turn(state)
-                    state = new_state if new_state else self.engine.get_state()
-                    time.sleep(0.05)
+                    pre_phase = _g(state, "GameState", "gameState")
+                    pre_turn = _g(state, "TurnCounter", "turnCounter")
+                    self.take_turn(state)
+                    # Block until the engine actually advances past this turn.
+                    # Polling on stale state and re-firing a move is what
+                    # produces the 409 "Action Already Processing" spam.
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline:
+                        time.sleep(POLL_INTERVAL)
+                        fresh = self.engine.get_state()
+                        if not fresh:
+                            continue
+                        state = fresh
+                        if self.is_game_over(state):
+                            break
+                        cur_phase = _g(state, "GameState", "gameState")
+                        cur_turn = _g(state, "TurnCounter", "turnCounter")
+                        if cur_phase != pre_phase or cur_turn != pre_turn:
+                            break
                 else:
                     time.sleep(POLL_INTERVAL)
                     state = self.engine.get_state() or state
