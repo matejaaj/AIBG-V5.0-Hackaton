@@ -18,10 +18,6 @@ Strategy summary:
     the frozen enemy so the monster gets free hits during MonsterTurn.
   - Pickup contest: if the enemy is racing us to a CC scroll or monster
     card we burn a CC scroll to delay them, then sprint to the pickup.
-  - Zone safety (time-based X-axis):
-      Turns 1-12  → stay outside the first/last 3 X-columns (X<=2, X>=29).
-      Turns 13+   → retreat from the first/last 6 X-columns (X<=5, X>=26)
-                    before those columns collapse.
 """
 from __future__ import annotations
 
@@ -57,13 +53,6 @@ ANTI_STUCK_WINDOW = 4
 SHRINK_INTERVAL  = 15
 DANGER_X_LO      = 2   # columns 0-2 vanish (left side)
 DANGER_X_HI      = 29  # columns 29-31 vanish (right side)
-
-# Time-based safe-zone thresholds.
-# Turns 1..EARLY_GAME_TURNS : stay outside the first/last 3 X-columns.
-# Turns > EARLY_GAME_TURNS  : must be outside the first/last 6 X-columns.
-EARLY_GAME_TURNS     = 12
-EXTENDED_DANGER_X_LO = 5   # columns 0-5 collapse in later shrinks
-EXTENDED_DANGER_X_HI = 26  # columns 26-31 collapse in later shrinks
 
 # Field types (mirror Models/Field.cs)
 F_BASE           = 0
@@ -667,35 +656,6 @@ def decide_zone_trap(view: GameView) -> Optional[Action]:
     return None
 
 
-def decide_zone_safety(view: GameView) -> Optional[Action]:
-    """Enforce time-based X-axis safe zones.
-
-    Turns 1-12 (early game): must stay outside X <= DANGER_X_LO (cols 0-2)
-                              and X >= DANGER_X_HI (cols 29-31).
-    Turns >12 (later):       must leave X <= EXTENDED_DANGER_X_LO (cols 0-5)
-                              and X >= EXTENDED_DANGER_X_HI (cols 26-31)
-                              as those columns will collapse.
-
-    Skipped when frozen (can't move anyway).
-    """
-    if view.has_status(S_FROZEN) or not view.my_pos:
-        return None
-    x, _ = view.my_pos
-
-    if view.turn_count <= EARLY_GAME_TURNS:
-        in_danger = x <= DANGER_X_LO or x >= DANGER_X_HI
-    else:
-        in_danger = x <= EXTENDED_DANGER_X_LO or x >= EXTENDED_DANGER_X_HI
-
-    if not in_danger:
-        return None
-
-    nxt = step_toward(view, view.my_pos, CENTER, view.my_move)
-    if nxt and nxt != view.my_pos:
-        return Move(nxt[0], nxt[1])
-    return None
-
-
 def decide_edge_safety(view: GameView) -> Optional[Action]:
     """Retreat inward if we are standing near collapsed/collapsing terrain."""
     if view.has_status(S_FROZEN) or not view.my_pos:
@@ -1038,9 +998,7 @@ PRIORITIES = [
     ("adjacent_cc_pickup",   decide_adjacent_cc_pickup),
     # 5. Zone trap (time-sensitive — must run before edge_safety)
     ("zone_trap",            decide_zone_trap),
-    # 6. Proactive time-based X-axis safe zone (early: X>2 and X<29; later: X>5 and X<26)
-    ("zone_safety",          decide_zone_safety),
-    # 7. Escape dying terrain ourselves
+    # 6. Escape dying terrain ourselves
     ("edge_safety",          decide_edge_safety),
     # 7. Ice Cube + freeze: freeze → summon cube adjacent to frozen enemy
     ("ice_cube_freeze",      decide_ice_cube_freeze),
