@@ -94,15 +94,15 @@ def decide(bot):
 
     # ── PHASE A: travel to center, with small on-path detours for pickups ──
     if not safe(me.position):
-        pickup = find_nearest(me, lambda t: is_pickup(t) and pickup_on_route(t))
-        if pickup is not None and grab_or_approach(pickup):
+        pickup = find_nearest(me, lambda t: is_pickup(t) and pickup_on_route(me, center, t))
+        if pickup is not None and grab_or_approach(bot, me, world, pickup, log):
             return
         log("action: travel to center", center)
         bot.move_toward(center) or bot.wander()    # always act — never freeze
         return
 
     # ── PHASE B: hold the zone — act only inside it, never leave ──
-    if summon_monster(within=safe):
+    if summon_monster(bot, me, enemy, center, safe, log, within=safe):
         return
 
     if enemy and bot.can_attack(enemy) and safe(enemy.position):
@@ -111,7 +111,7 @@ def decide(bot):
         return
 
     target = find_nearest(me, lambda t: is_pickup(t) and safe(tile_position(t)))
-    if target and grab_or_approach(target, within=safe):
+    if target and grab_or_approach(bot, me, world, target, log, within=safe):
         return
 
     if enemy and safe(enemy.position):         # enemy is in our zone — close in
