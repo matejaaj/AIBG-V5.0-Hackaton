@@ -43,16 +43,34 @@ MAP_W            = 32
 MAP_H            = 16
 CENTER           = (MAP_W // 2, MAP_H // 2)
 
-LOW_HP_RATIO     = 0.30
-HEAL_HP_RATIO    = 0.55
+LOW_HP_RATIO     = 0.30   # critical — retreat / heal in emergency
+HEAL_USE_RATIO   = 0.50   # use or chase heal once HP drops here
+HEAL_HP_RATIO    = 0.55   # healing pickup priority threshold
 LATE_GAME_TURN   = 70
 ANTI_STUCK_WINDOW = 4
+
+# Distance threshold: if enemy is farther than this, hunt neutral monsters instead.
+# Killing monsters gives +4 HP / +2 ATK (Ice Cube) or +10 HP (Ice Warrior).
+HUNT_MONSTER_DIST = 8
+
+# Center-zone offense: when the bot is inside this rectangle it is safe from
+# zone collapse and should press the attack instead of farming / picking up.
+CENTER_ZONE_X_LO    = 8    # X range of the "safe center" rectangle
+CENTER_ZONE_X_HI    = 24
+CENTER_ZONE_Y_LO    = 3    # Y range
+CENTER_ZONE_Y_HI    = 13
+OFFENSE_CHASE_RANGE = 12   # chase enemy when within this many tiles
 
 # Map-shrink mechanics: every SHRINK_INTERVAL turns the outer X columns vanish.
 # Danger zone: X=0..2 (left) and X=29..31 (right) collapse first.
 SHRINK_INTERVAL  = 15
 DANGER_X_LO      = 2   # columns 0-2 vanish (left side)
 DANGER_X_HI      = 29  # columns 29-31 vanish (right side)
+
+# Safe-zone lock: once the bot enters X in [SAFE_X_LO, SAFE_X_HI] it never
+# returns to the outer strips.  Outer columns become permanently unwalkable.
+SAFE_X_LO        = 5
+SAFE_X_HI        = 26
 
 # Field types (mirror Models/Field.cs)
 F_BASE           = 0
@@ -236,7 +254,7 @@ def _pickup_priority_score(field_entry: dict, hp_ratio: float) -> int:
     if item:
         t = _item_type_label(item)
         if t == "freeze":    return 0
-        if t == "confusion": return 1
+        if t == "confusion": return 0  # same urgency as freeze — both are CC
         if t == "healing":   return 3 if hp_ratio < HEAL_HP_RATIO else 6
     if card:
         return 2
@@ -276,7 +294,11 @@ class GameView:
 
         # Routing flags (set by bot after construction)
         self.allow_spikes: bool = False
+        self.safe_zone_locked: bool = False   # True once bot reached X in [SAFE_X_LO, SAFE_X_HI]
         self.rejected_targets: set = set()
+        self.rejected_pickups: set = set()   # pickup positions that failed this turn
+        self.rejected_summons: set = set()   # (card_id, x, y) summons that failed this turn
+        self.last_was_attack: bool = False    # True when previous action was Attack
 
         players_dict = _g(state, "Players", "players", default={}) or {}
         players = list(players_dict.values()) if isinstance(players_dict, dict) else list(players_dict)
@@ -307,14 +329,18 @@ class GameView:
                 p = (x, y)
             self._field_by_xy[p] = f
 
-        self.monsters: list = []
-        self.pickups:  list = []
+        self.monsters:    list = []
+        self.my_summons: list = []   # live entities summoned by this player
+        self.pickups:    list = []
         for (x, y), f in self._field_by_xy.items():
             ent = _g(f, "Entity", "entity")
             if ent and isinstance(ent, dict):
                 if "$ref" not in ent and "$Ref" not in ent:
-                    eid = _g(ent, "Id", "id")
-                    if (eid is not None
+                    eid        = _g(ent, "Id", "id")
+                    summon_by  = _g(ent, "SummonedByPlayerId", "summonedByPlayerId")
+                    if summon_by == my_id:
+                        self.my_summons.append(ent)         # track own live summons
+                    elif (eid is not None
                             and eid != my_id
                             and (self.enemy is None or eid != _g(self.enemy, "Id", "id"))):
                         self.monsters.append(ent)
@@ -337,6 +363,19 @@ class GameView:
         self.enemy_inventory: list = (_g(self.enemy, "Inventory",      "inventory",      default=[]) or []) if self.enemy else []
         self.enemy_status:    dict = (_g(self.enemy, "ActiveStatuses", "activeStatuses", default={}) or {}) if self.enemy else {}
 
+        # Grid entities stored as JSON $ref back-references are skipped by the
+        # entity scan above.  Patch my_summons by also scanning card monster data.
+        _seen_ids = {int(_g(s, "Id", "id") or 0) for s in self.my_summons}
+        for _card in self.my_cards:
+            _mon = _g(_card, "Monster", "monster")
+            if not _mon:
+                continue
+            _mid = int(_g(_mon, "Id", "id") or 0)
+            _mby = _g(_mon, "SummonedByPlayerId", "summonedByPlayerId")
+            if _mid != 0 and _mby == my_id and _mid not in _seen_ids:
+                self.my_summons.append(_mon)
+                _seen_ids.add(_mid)
+
     # -----------------------------------------------------------------------
     def field(self, x: int, y: int) -> Optional[dict]:
         return self._field_by_xy.get((x, y))
@@ -355,8 +394,12 @@ class GameView:
         """True if (x,y) can be entered.
         Ice-spike tiles are allowed only when self.allow_spikes is True
         (set by the bot when a healing potion is in inventory).
+        Once safe_zone_locked is True, columns outside [SAFE_X_LO, SAFE_X_HI]
+        are treated as impassable.
         """
         if not self.in_bounds(x, y):
+            return False
+        if self.safe_zone_locked and (x < SAFE_X_LO or x > SAFE_X_HI):
             return False
         ft = self.field_type(x, y)
         walkable = WALKABLE | ({F_OBSTACLE} if self.allow_spikes else set())
@@ -366,6 +409,23 @@ class GameView:
             f = self.field(x, y)
             if f and _g(f, "Entity", "entity"):
                 return False
+        return True
+
+    def is_summonable(self, x: int, y: int) -> bool:
+        """True if a monster can be summoned at (x,y).
+        Rules: in bounds, no entity present, not a wall (F_WALL=5) or lake (F_EMPTY=6).
+        Spike tiles (F_OBSTACLE=3) are allowed — unlike walking, summoning doesn't
+        require the tile to be passable by the player.  Safe-zone restriction does
+        NOT apply to summon placement.
+        """
+        if not self.in_bounds(x, y):
+            return False
+        ft = self.field_type(x, y)
+        if ft in DEAD_TERRAIN:  # F_WALL=5, F_EMPTY=6
+            return False
+        f = self.field(x, y)
+        if f and _g(f, "Entity", "entity"):
+            return False
         return True
 
     def has_status(self, name: str) -> bool:
@@ -391,18 +451,20 @@ def _find_cc_scroll(view: GameView) -> Optional[dict]:
     return _find_freeze_scroll(view) or _find_confusion_scroll(view)
 
 def _find_ice_cube_card(view: GameView) -> Optional[dict]:
-    """Return first ready (non-cooldown) Ice-Cube monster card."""
+    """Return first ready (non-cooldown) Ice-Cube monster card with no live summon."""
     for c in view.my_cards:
         if bool(_g(c, "OnCooldown", "onCooldown", default=False)):
             continue
         mon  = _g(c, "Monster", "monster") or {}
-        name = str(_g(mon, "Name", "name", default="")).lower()
-        if "cube" in name or "ice" in name:
+        # Check card's own Name first, then fall back to monster template name
+        card_name = str(_g(c, "Name", "name", default="")).lower()
+        mon_name  = str(_g(mon, "Name", "name", default="")).lower()
+        if "cube" in card_name or "ice" in card_name or "cube" in mon_name or "ice" in mon_name:
             return c
     return None
 
 def _find_any_usable_card(view: GameView) -> Optional[dict]:
-    """Return the highest-attack ready card."""
+    """Return the highest-attack ready card with no live summon."""
     best = None
     best_atk = -1
     for c in view.my_cards:
@@ -501,6 +563,10 @@ def single_axis_moves(view: GameView, start, max_dist: int) -> list:
             cx, cy = start[0] + dx * k, start[1] + dy * k
             if not view.is_walkable(cx, cy):
                 break
+            # Spike tiles (F_OBSTACLE) are impassable as destinations on the
+            # server regardless of allow_spikes mode — break without adding.
+            if view.field_type(cx, cy) == F_OBSTACLE:
+                break
             # Server stops movement at tiles with items or monster cards
             f = view.field(cx, cy)
             if f and (_g(f, "Item", "item") or _g(f, "MonsterCard", "monsterCard")):
@@ -572,6 +638,8 @@ def _monster_in_range(view: GameView) -> Optional[dict]:
 
 def decide_lethal(view: GameView) -> Optional[Action]:
     """Finish the enemy in one hit."""
+    if view.last_was_attack:
+        return None
     if _enemy_in_range(view) and view.my_atk >= view.enemy_hp > 0:
         return Attack(int(_g(view.enemy, "Id", "id")))
     return None
@@ -630,7 +698,7 @@ def decide_adjacent_cc_pickup(view: GameView) -> Optional[Action]:
     for (x, y), f in view.pickups:
         if _pickup_priority_score(f, hp_ratio) > 2:   # only CC scrolls (0,1) and cards (2)
             continue
-        if manhattan(view.my_pos, (x, y)) == 1:
+        if manhattan(view.my_pos, (x, y)) == 1 and (x, y) not in view.rejected_pickups:
                 return Pickup(x, y, f)
 
 
@@ -653,6 +721,20 @@ def decide_zone_trap(view: GameView) -> Optional[Action]:
     scroll = _find_cc_scroll(view)
     if scroll:
         return UseItem(int(_g(scroll, "Id", "id")))
+    return None
+
+
+def decide_escape_spike(view: GameView) -> Optional[Action]:
+    """If standing on a spike tile (F_OBSTACLE), immediately step off onto safe ground."""
+    if not view.my_pos:
+        return None
+    if view.field_type(*view.my_pos) != F_OBSTACLE:
+        return None
+    x, y = view.my_pos
+    for dx, dy in NEIGHBORS_4:
+        nx, ny = x + dx, y + dy
+        if view.in_bounds(nx, ny) and view.field_type(nx, ny) in WALKABLE and (nx, ny) not in view.rejected_targets:
+            return Move(nx, ny)
     return None
 
 
@@ -686,6 +768,30 @@ def decide_edge_safety(view: GameView) -> Optional[Action]:
     return None
 
 
+def _should_use_cc_now(view: GameView) -> bool:
+    """Return True only when it is a good moment to spend a CC scroll.
+
+    We save Freeze / Confusion scrolls for two situations:
+      1. Offensive mode: bot is inside the center zone AND the enemy is
+         close — we are pressing the attack, best time to lock them down.
+      2. Zone pressure: our own tile is in the danger zone and the next
+         shrink is ≤ 2 turns away — use it before we lose the position.
+    """
+    if not view.my_pos:
+        return False
+    x, y = view.my_pos
+    # Offensive mode: in center zone and enemy is nearby
+    in_center = (CENTER_ZONE_X_LO <= x <= CENTER_ZONE_X_HI and
+                 CENTER_ZONE_Y_LO <= y <= CENTER_ZONE_Y_HI)
+    if (in_center and view.enemy_pos and
+            manhattan(view.my_pos, view.enemy_pos) <= OFFENSE_CHASE_RANGE):
+        return True
+    # Zone pressure: our position is about to be consumed by the shrink
+    if _is_in_danger_zone(x) and _turns_to_next_shrink(view.turn_count) <= 2:
+        return True
+    return False
+
+
 def decide_ice_cube_freeze(view: GameView) -> Optional[Action]:
     """Ice Cube + Freeze combo.
 
@@ -704,9 +810,10 @@ def decide_ice_cube_freeze(view: GameView) -> Optional[Action]:
 
     if not _enemy_is_frozen(view):
         freeze = _find_freeze_scroll(view)
-        if freeze:
+        # Only spend the scroll when it's a good moment — save it otherwise.
+        if freeze and _should_use_cc_now(view):
             return UseItem(int(_g(freeze, "Id", "id")))
-        return None  # no freeze — can't set up the combo
+        return None  # no freeze or not the right time — can't set up the combo
 
     # Enemy is frozen — place the cube on the adjacent-to-US tile closest to
     # the enemy (server only allows summon 1 step from the player, not 1 step
@@ -716,7 +823,7 @@ def decide_ice_cube_freeze(view: GameView) -> Optional[Action]:
     best_dist = 10**9
     for dx, dy in NEIGHBORS_4:
         sx, sy = mx + dx, my + dy
-        if view.is_walkable(sx, sy):
+        if view.is_summonable(sx, sy):
             d = manhattan((sx, sy), view.enemy_pos)
             if d < best_dist:
                 best_dist = d
@@ -725,7 +832,7 @@ def decide_ice_cube_freeze(view: GameView) -> Optional[Action]:
         return Summon(int(_g(ice_card, "Id", "id")), best_cell[0], best_cell[1])
 
     # No free adjacent cell — fall back to attacking the frozen enemy
-    if _enemy_in_range(view):
+    if _enemy_in_range(view) and not view.last_was_attack:
         return Attack(int(_g(view.enemy, "Id", "id")))
     nxt = step_toward(view, view.my_pos, view.enemy_pos, view.my_move)
     if nxt:
@@ -745,8 +852,8 @@ def decide_freeze_combo(view: GameView) -> Optional[Action]:
         return None
 
     if _enemy_is_frozen(view):
-        # Enemy can't move — maximise damage
-        if _enemy_in_range(view):
+        # Enemy can't move — maximise damage (but not two attacks in a row)
+        if _enemy_in_range(view) and not view.last_was_attack:
             return Attack(int(_g(view.enemy, "Id", "id")))
         nxt = step_toward(view, view.my_pos, view.enemy_pos, view.my_move)
         if nxt:
@@ -754,28 +861,115 @@ def decide_freeze_combo(view: GameView) -> Optional[Action]:
         return None
 
     dist  = manhattan(view.my_pos, view.enemy_pos)
-    # Only freeze when we can reach + attack in one turn (truly "close").
+    # Only CC when we can reach + attack in one turn (truly "close").
     # Also verify the scroll is actually in inventory before using it.
+    # And only spend it when the timing is right (offensive / zone-pressure).
     close = view.my_move + view.my_range
-    if dist <= close:
+    if dist <= close and _should_use_cc_now(view):
         # If we also have an ice cube, the richer combo should fire first
         if not _find_ice_cube_card(view):
-            freeze = _find_freeze_scroll(view)
-            if freeze:  # inventory check: returns None if not carried
-                return UseItem(int(_g(freeze, "Id", "id")))
+            # Freeze preferred (enemy locked in place); confusion as fallback
+            # (enemy moves randomly — still disrupts their positioning)
+            cc = _find_freeze_scroll(view) or _find_confusion_scroll(view)
+            if cc:  # inventory check: returns None if not carried
+                return UseItem(int(_g(cc, "Id", "id")))
+    return None
+
+
+def decide_low_hp_heal(view: GameView) -> Optional[Action]:
+    """Use a carried heal, or move toward the nearest heal pickup, when HP < 50%.
+
+    Fires before combat decisions so the bot actively prioritises survival.
+    If no heal exists anywhere on the map the function returns None and the
+    normal combat pipeline continues.
+    """
+    if not view.me or not view.my_pos:
+        return None
+    if view.my_hp / max(1, view.my_max_hp) >= HEAL_USE_RATIO:
+        return None
+
+    # Already carrying a heal — consume it immediately
+    heal = _find_healing_item(view)
+    if heal:
+        return UseItem(int(_g(heal, "Id", "id")))
+
+    # No heal in inventory — find the nearest reachable heal tile on the map
+    if not view.pickups:
+        return None
+    INF    = view.map_w * view.map_h + 1
+    my_bfs = reachable_cells(view, view.my_pos)
+    best_pos  = None
+    best_dist = INF
+    for (x, y), f in view.pickups:
+        item = _g(f, "Item", "item")
+        if not item or _item_type_label(item) != "healing":
+            continue
+        d = my_bfs.get((x, y), INF)
+        if d < best_dist:
+            best_dist = d
+            best_pos  = (x, y)
+
+    if best_pos is None:
+        return None  # no heal on map — let combat pipeline handle it
+
+    if manhattan(view.my_pos, best_pos) == 1 and best_pos not in view.rejected_pickups:
+        return Pickup(best_pos[0], best_pos[1], view.field(*best_pos))
+    nxt = step_toward(view, view.my_pos, best_pos, view.my_move)
+    if nxt:
+        return Move(nxt[0], nxt[1])
     return None
 
 
 def decide_opportunity(view: GameView) -> Optional[Action]:
-    """Attack when in range and strategically worthwhile."""
+    """Attack whenever a target is in range — enemy player first, then any monster.
+
+    No HP/ATK conditions: always swing when you can.  Killing neutral monsters
+    grants HP and ATK buffs (server: BuffPlayers), so it is never wasteful.
+    """
+    if view.last_was_attack:
+        return None
+    # Enemy player — highest priority
     if _enemy_in_range(view) and view.enemy_hp > 0:
-        if view.my_atk * 3 >= view.enemy_hp or view.my_hp > view.enemy_hp:
-            return Attack(int(_g(view.enemy, "Id", "id")))
+        return Attack(int(_g(view.enemy, "Id", "id")))
+    # Any neutral monster in range — free buff
     mon = _monster_in_range(view)
     if mon is not None:
-        mhp = int(_g(mon, "Health", "health", default=0))
-        if mhp <= view.my_atk * 2:
-            return Attack(int(_g(mon, "Id", "id")))
+        return Attack(int(_g(mon, "Id", "id")))
+    return None
+
+
+def decide_summon_close(view: GameView) -> Optional[Action]:
+    """Summon the highest-ATK card when the enemy is within close range.
+
+    Fires when the enemy is within my_move + 2 tiles so the summoned monster
+    can reach and attack them on the very next MonsterTurn.  The spawn cell
+    must be an adjacent, unoccupied, walkable tile (server rejects occupied
+    positions).  Prefers the adjacent cell closest to the enemy.
+    """
+    if not view.my_cards or not view.my_pos or not view.enemy_pos:
+        return None
+    if view.my_summons:                  # already have a live summon on the field
+        return None
+    if manhattan(view.my_pos, view.enemy_pos) > view.my_move + 8:
+        return None  # enemy too far — let decide_summon handle it
+
+    card = _find_any_usable_card(view)
+    if not card:
+        return None
+    card_id = int(_g(card, "Id", "id"))
+    mx, my  = view.my_pos
+
+    candidates = []
+    for dx, dy in NEIGHBORS_4:
+        sx, sy = mx + dx, my + dy
+        if view.is_summonable(sx, sy):
+            candidates.append((manhattan((sx, sy), view.enemy_pos), sx, sy))
+    if not candidates:
+        return None
+    candidates.sort()
+    for _, sx, sy in candidates:
+        if (card_id, sx, sy) not in view.rejected_summons:
+            return Summon(card_id, sx, sy)
     return None
 
 
@@ -798,6 +992,12 @@ def decide_contest_pickup(view: GameView) -> Optional[Action]:
     my_bfs    = reachable_cells(view, view.my_pos)
     enemy_bfs = reachable_cells(view, view.enemy_pos)
 
+    # Only contest pickups we can realistically reach ourselves.
+    # Burning a CC scroll from across the map is wasteful — the freeze wears
+    # off long before we arrive.  Threshold: our BFS distance must be < half
+    # the map area (i.e. the tile is actually reachable in reasonable time).
+    MAX_CONTEST_DIST = (view.map_w + view.map_h) * 2
+
     sorted_pus = sorted(view.pickups,
                         key=lambda p: _pickup_priority_score(p[1], hp_ratio))
     for (px, py), f in sorted_pus:
@@ -808,6 +1008,8 @@ def decide_contest_pickup(view: GameView) -> Optional[Action]:
         enemy_dist = enemy_bfs.get((px, py), INF)
         if enemy_dist > my_dist:
             continue  # we are already ahead
+        if my_dist > MAX_CONTEST_DIST:
+            continue  # too far away — CC scroll won't help us get there in time
 
         if _enemy_is_cc(view):
             # Enemy already slowed — sprint to the tile
@@ -853,11 +1055,10 @@ def decide_pickup(view: GameView) -> Optional[Action]:
         key=lambda pu: (_pickup_priority_score(pu[1], hp_ratio), my_bfs.get(pu[0], INF))
     )
 
-    # 1) On the tile OR adjacent → pickup directly (saves one turn)
-    #    Manhattan is fine here: two cells that are literally 1 step apart
-    #    are always directly adjacent regardless of other terrain.
+    # 1) Adjacent (dist==1) → pickup directly (saves one turn).
+    #    dist==0 (on-tile) is handled by decide_on_tile_pickup which steps off first.
     for (x, y), f in sorted_pus:
-        if manhattan(view.my_pos, (x, y)) <= 1:
+        if manhattan(view.my_pos, (x, y)) == 1 and (x, y) not in view.rejected_pickups:
             return Pickup(x, y, f)
 
     # 2) Within move range by actual BFS path → step toward; pickup next turn
@@ -882,32 +1083,78 @@ def decide_pickup(view: GameView) -> Optional[Action]:
 
 
 def decide_summon(view: GameView) -> Optional[Action]:
-    """Summon highest-ATK available card on a tile adjacent to the player.
+    """Summon highest-ATK available card whenever a card is ready.
 
-    The server only accepts a summon position that is exactly 1 step (up/down/
-    left/right) from the player.  Among valid adjacent tiles we prefer the one
-    closest to the enemy so the monster can attack quickly.
+    Fires any time we have a non-cooldown card and no live summon on the field.
+    Prefers the adjacent cell closest to the enemy (or to the map centre when
+    the enemy position is unknown).
     """
-    if not view.my_cards or not view.my_pos or not view.enemy_pos:
+    if not view.my_cards or not view.my_pos:
+        return None
+    if view.my_summons:                  # already have a live summon on the field
         return None
     card = _find_any_usable_card(view)
     if not card:
         return None
     card_id = int(_g(card, "Id", "id"))
     mx, my  = view.my_pos
+    ref_pos = view.enemy_pos if view.enemy_pos else CENTER
 
     # Only tiles that are exactly 1 step from the player are valid summon spots
     candidates = []
     for dx, dy in NEIGHBORS_4:
         sx, sy = mx + dx, my + dy
-        if view.is_walkable(sx, sy):
-            d = manhattan((sx, sy), view.enemy_pos)
+        if view.is_summonable(sx, sy):
+            d = manhattan((sx, sy), ref_pos)
             candidates.append((d, sx, sy))
     if not candidates:
         return None
     candidates.sort()
-    _, sx, sy = candidates[0]
-    return Summon(card_id, sx, sy)
+    for _, sx, sy in candidates:
+        if (card_id, sx, sy) not in view.rejected_summons:
+            return Summon(card_id, sx, sy)
+    return None
+
+
+def decide_hunt_monsters(view: GameView) -> Optional[Action]:
+    """Chase and kill neutral monsters when the enemy is far away.
+
+    Killing a neutral monster gives permanent buffs (server BuffPlayers):
+      Ice Cube / default  → +4 HP, +4 MaxHP, +2 ATK
+      Ice Warrior         → +10 HP, +10 MaxHP
+      Ice Mage            → +10 ATK
+
+    Fires only when the enemy is more than HUNT_MONSTER_DIST tiles away so
+    the bot does not ignore a nearby enemy in favour of farming.
+    """
+    if not view.my_pos or not view.monsters:
+        return None
+    if view.enemy_pos and manhattan(view.my_pos, view.enemy_pos) <= HUNT_MONSTER_DIST:
+        return None  # enemy is close — keep focus on them
+
+    # Attack a monster already in range (no cooldown check needed for attacks)
+    if not view.last_was_attack:
+        mon = _monster_in_range(view)
+        if mon is not None:
+            return Attack(int(_g(mon, "Id", "id")))
+
+    # Chase the nearest reachable monster
+    INF = view.map_w * view.map_h + 1
+    my_bfs = reachable_cells(view, view.my_pos)
+    best_pos  = None
+    best_dist = INF
+    for m in view.monsters:
+        mp = _pos(_g(m, "Position", "position"))
+        if mp:
+            d = my_bfs.get(mp, INF)
+            if d < best_dist:
+                best_dist = d
+                best_pos  = mp
+    if best_pos and best_dist < INF:
+        nxt = step_toward(view, view.my_pos, best_pos, view.my_move)
+        if nxt:
+            return Move(nxt[0], nxt[1])
+    return None
 
 
 def decide_powerup(view: GameView) -> Optional[Action]:
@@ -963,6 +1210,30 @@ def _nearest_walkable_to(view: GameView, cx: int, cy: int) -> tuple:
     return (cx, cy)
 
 
+def decide_center_offense(view: GameView) -> Optional[Action]:
+    """When safely positioned in the center zone, chase the enemy directly.
+
+    Fires BEFORE summon/pickup/hunt decisions so the bot uses its safe
+    central position to press the attack rather than detouring for items.
+    Only active when the enemy is within OFFENSE_CHASE_RANGE tiles — if
+    they are far away the normal pickup / hunt pipeline is more efficient.
+    """
+    if not view.my_pos or not view.enemy_pos:
+        return None
+    if view.has_status(S_FROZEN):
+        return None
+    x, y = view.my_pos
+    if not (CENTER_ZONE_X_LO <= x <= CENTER_ZONE_X_HI and
+            CENTER_ZONE_Y_LO <= y <= CENTER_ZONE_Y_HI):
+        return None
+    if manhattan(view.my_pos, view.enemy_pos) > OFFENSE_CHASE_RANGE:
+        return None
+    nxt = step_toward(view, view.my_pos, view.enemy_pos, view.my_move)
+    if nxt and nxt != view.my_pos:
+        return Move(nxt[0], nxt[1])
+    return None
+
+
 def decide_fallback(view: GameView) -> Optional[Action]:
     """Last resort: move toward centre or any walkable neighbour."""
     if view.has_status(S_FROZEN) or not view.my_pos:
@@ -974,10 +1245,15 @@ def decide_fallback(view: GameView) -> Optional[Action]:
     rng = random.Random(hash(view.my_pos) & 0xFFFF)
     opts = list(NEIGHBORS_4)
     rng.shuffle(opts)
+    # Prefer truly free neighbours; only fall back to entity-occupied cells
+    # as an absolute last resort (avoids infinite loop caused by repeatedly
+    # trying to enter a cell blocked by our own summoned monster).
     for dx, dy in opts:
         nx, ny = view.my_pos[0] + dx, view.my_pos[1] + dy
-        # ignore_entities=True so an entity-occupied cell is still attempted
-        # rather than returning None and forfeiting the turn
+        if view.is_walkable(nx, ny):          # respects entities
+            return Move(nx, ny)
+    for dx, dy in opts:
+        nx, ny = view.my_pos[0] + dx, view.my_pos[1] + dy
         if view.is_walkable(nx, ny, ignore_entities=True):
             return Move(nx, ny)
     return None
@@ -990,34 +1266,44 @@ def decide_fallback(view: GameView) -> Optional[Action]:
 PRIORITIES = [
     # 1. Instant kill
     ("lethal",               decide_lethal),
-    # 2. Self-preservation
+    # 2. Self-preservation (critical — <30% HP)
     ("emergency",            decide_emergency),
     # 3. Standing ON an item tile — always grab before anything else
     ("on_tile_pickup",       decide_on_tile_pickup),
+    # 3b. Escape spike tile immediately (takes damage every turn)
+    ("escape_spike",         decide_escape_spike),
     # 4. Adjacent to a CC scroll / card — grab before combat
     ("adjacent_cc_pickup",   decide_adjacent_cc_pickup),
-    # 5. Zone trap (time-sensitive — must run before edge_safety)
+    # 5. Use/seek heal when HP < 50%  (survival priority)
+    ("low_hp_heal",          decide_low_hp_heal),
+    # 6. Zone trap (time-sensitive — must run before edge_safety)
     ("zone_trap",            decide_zone_trap),
-    # 6. Escape dying terrain ourselves
+    # 7. Escape dying terrain ourselves
     ("edge_safety",          decide_edge_safety),
-    # 7. Ice Cube + freeze: freeze → summon cube adjacent to frozen enemy
+    # 8. Ice Cube + freeze: freeze → summon cube adjacent to frozen enemy
     ("ice_cube_freeze",      decide_ice_cube_freeze),
-    # 8. Simple freeze → close in → attack cycle
+    # 9. Simple freeze → close in → attack cycle
     ("freeze_combo",         decide_freeze_combo),
-    # 9. Attack when already in range
+    # 10. Attack when already in range (enemy first, then any monster)
     ("opportunity",          decide_opportunity),
-    # 10. Block enemy from grabbing CC scroll / card
+    # 11. Center-zone offense: chase enemy before any pickup/hunt detours
+    ("center_offense",       decide_center_offense),
+    # 12. Summon card when enemy is within range (my_move + 8)
+    ("summon_close",         decide_summon_close),
+    # 12. Summon whenever a card is ready and no live summon exists
+    ("summon",               decide_summon),
+    # 13. Block enemy from grabbing CC scroll / card
     ("contest_pickup",       decide_contest_pickup),
-    # 11. Pick up remaining items (healing etc.) + approach logic
+    # 14. Pick up remaining items (healing etc.) + approach logic
     ("pickup",               decide_pickup),
-    # 10. Summon a monster
-    ("summon",          decide_summon),
-    # 11. Move toward a POWERUP tile
-    ("powerup",         decide_powerup),
-    # 12. Chase enemy / late-game edge push
-    ("pressure",        decide_pressure),
-    # 13. Move toward centre / random step
-    ("fallback",        decide_fallback),
+    # 15. Hunt neutral monsters for HP/ATK buffs when enemy is far
+    ("hunt_monsters",        decide_hunt_monsters),
+    # 16. Move toward a POWERUP tile
+    ("powerup",              decide_powerup),
+    # 17. Chase enemy / late-game edge push
+    ("pressure",             decide_pressure),
+    # 18. Move toward centre / random step
+    ("fallback",             decide_fallback),
 ]
 
 
@@ -1035,6 +1321,10 @@ class MonsterHuntBot:
         self._tie_seed  = hash(bot_name) & 0xFFFF
         self.history    = []
         self._rejected_targets = set()
+        self._rejected_pickups: set = set()
+        self._rejected_summons: set = set()
+        self._reached_safe_zone: bool = False   # latches True once inside X [SAFE_X_LO, SAFE_X_HI]
+        self._last_was_attack:   bool = False   # tracks back-to-back attack prevention
         self._turn_key  = None
         self.log    = self._setup_logger(bot_name)
         self.engine = Engine(server_url, game_id, self.log)
@@ -1111,7 +1401,8 @@ class MonsterHuntBot:
         positions = {h[1] for h in recent}
         actions   = {h[2] for h in recent}
         no_combat = not any(a in ("lethal", "opportunity", "freeze_combo",
-                                  "ice_cube_freeze", "zone_trap") for a in actions)
+                                  "ice_cube_freeze", "zone_trap",
+                                  "summon", "summon_close") for a in actions)
         return len(positions) <= 2 and no_combat
 
     def _unstick(self, view: GameView) -> Optional[Action]:
@@ -1197,12 +1488,22 @@ class MonsterHuntBot:
         turn_key = (game_turn, _g(state, "GameState", "gameState"))
         if turn_key != self._turn_key:
             self._rejected_targets.clear()
+            self._rejected_pickups.clear()
+            self._rejected_summons.clear()
             self._turn_key = turn_key
 
         view = GameView(state, self.player_id, game_turn, tie_seed=self._tie_seed)
         view.rejected_targets = self._rejected_targets
+        view.rejected_pickups = self._rejected_pickups
+        view.rejected_summons = self._rejected_summons
         # Allow spike shortcuts only when we carry a healing potion
         view.allow_spikes = _find_healing_item(view) is not None
+        # One-way safe zone lock: once inside X [SAFE_X_LO, SAFE_X_HI], outer
+        # columns are permanently forbidden so the bot never drifts back out.
+        if view.my_pos and SAFE_X_LO <= view.my_pos[0] <= SAFE_X_HI:
+            self._reached_safe_zone = True
+        view.safe_zone_locked = self._reached_safe_zone
+        view.last_was_attack  = self._last_was_attack
 
         if not view.me or not view.my_pos:
             self.log.warning("no self in state — skipping turn")
@@ -1269,6 +1570,7 @@ class MonsterHuntBot:
         self._dataset_log(state, label, action)
         self.history.append((self.turn_count, view.my_pos, label))
 
+        self._last_was_attack = isinstance(action, Attack)
         self._last_action = action
         # Store the real (pre-inversion) target so rejected_targets always
         # tracks what we actually wanted to reach, not the flipped request.
@@ -1280,6 +1582,12 @@ class MonsterHuntBot:
             rejected = real_move_target if real_move_target is not None else (action.x, action.y)
             self._rejected_targets.add(rejected)
             self.log.info("engine rejected Move, real target (%s,%s)", rejected[0], rejected[1])
+        elif result is None and isinstance(action, Pickup):
+            self._rejected_pickups.add((action.x, action.y))
+            self.log.info("engine rejected Pickup(%s,%s)", action.x, action.y)
+        elif result is None and isinstance(action, Summon):
+            self._rejected_summons.add((action.card_id, action.x, action.y))
+            self.log.info("engine rejected Summon(card=%s, %s,%s)", action.card_id, action.x, action.y)
         return result
 
     def play(self) -> None:
@@ -1324,6 +1632,18 @@ class MonsterHuntBot:
                             self.log.info(
                                 "state unchanged after Move, real target (%s,%s) — marking rejected",
                                 rejected[0], rejected[1],
+                            )
+                        elif isinstance(last, Pickup):
+                            self._rejected_pickups.add((last.x, last.y))
+                            self.log.info(
+                                "state unchanged after Pickup(%s,%s) — marking rejected",
+                                last.x, last.y,
+                            )
+                        elif isinstance(last, Summon):
+                            self._rejected_summons.add((last.card_id, last.x, last.y))
+                            self.log.info(
+                                "state unchanged after Summon(card=%s, %s,%s) — marking rejected",
+                                last.card_id, last.x, last.y,
                             )
                 else:
                     time.sleep(POLL_INTERVAL)
@@ -1427,7 +1747,7 @@ def run_tests() -> int:
     heal_item = {"Id": 50, "Name": "Healing Potion", "ItemType": "Healing", "Effect": "heal"}
     conf_item = {"Id": 51, "Name": "Confusion Scroll", "ItemType": "CrowdControl", "Effect": "confusion"}
     assert _pickup_priority_score({"Item": freeze_item}, 1.0) == 0
-    assert _pickup_priority_score({"Item": conf_item},   1.0) == 1
+    assert _pickup_priority_score({"Item": conf_item},   1.0) == 0
     assert _pickup_priority_score({"MonsterCard": {"Id": 1, "Name": "IceCube"}}, 1.0) == 2
     assert _pickup_priority_score({"Item": heal_item},   0.2) == 3
     assert _pickup_priority_score({"Item": heal_item},   1.0) == 6
