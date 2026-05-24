@@ -43,10 +43,10 @@ if str(CURRENT_DIR) not in sys.path:
 from game_client import Bot  # noqa: E402
 from game_api import (  # noqa: E402
     Field, ItemType, Status, Entity, Item,
-    is_pickup, tile_position,
+    is_pickup, is_card, is_healing, tile_position,
 )
 from pathfinding import find_nearest  # noqa: E402
-from strategy_helpers import grab_or_approach, summon_monster, pickup_on_route  # noqa: E402
+from strategy_helpers import grab_or_approach, summon_monster, can_afford_pickup  # noqa: E402
 
 # Debug is ON by default (the GUI launcher can't set env vars): logs a snapshot +
 # the chosen action each turn and dumps the latest state to bot_state.json.
@@ -86,43 +86,138 @@ def decide(bot):
     center = world.center()
     safe = world.is_permanently_safe
 
+    # Effective HP: current health + healing value of all potions in inventory.
+    eff_hp = me.health + sum(
+        (it.power or 0) for it in me.inventory if it.item_type == ItemType.HEALING
+    )
+    # Max spike damage anywhere on the map (read once per turn).
+    _max_spike = 0
+    for _tile in world._grid:
+        if isinstance(_tile, dict):
+            _obs = _tile.get('Obstacle') or _tile.get('obstacle')
+            if isinstance(_obs, dict):
+                _dmg = int(_obs.get('Damage') or _obs.get('damage') or 0)
+                if _dmg > _max_spike:
+                    _max_spike = _dmg
+    # Cross spikes only when already in the permanently-safe zone AND effective
+    # HP exceeds the worst single-tile spike damage.
+    allow_spikes = safe(me.position) and _max_spike > 0 and eff_hp > _max_spike
+    avoid_spikes = not allow_spikes
+    if allow_spikes:
+        log(f"spike-crossing ON (eff_hp={eff_hp} > max_spike={_max_spike})")
+
+    # Log any active status effects so they're visible at the top of each turn.
+    if me.statuses:
+        log("statuses:", dict(me.statuses))
+
     # Heal when low (any phase).
     if me.health <= me.max_health * 0.4 and bot.healing_item():
         log("action: heal (low health)")
         bot.use_healing()
         return
 
-    # ── PHASE A: travel to center, with small on-path detours for pickups ──
+    # ── Item inventory full: proactively use one to free a slot ─────────────
+    # Priority: heal (if not at full HP) → freeze.
+    # Dizzy is intentionally never used — it is unreliable for offense and the
+    # anti-invert defense we already have is the correct response to it.
+    # Strict tactical conditions (adjacency etc.) do NOT apply here — the goal
+    # is purely to open a slot so we can pick up something better.
+    if len(me.inventory) >= 3:
+        if bot.healing_item() and me.health < me.max_health:
+            log("action: heal (inventory full — freeing slot + healing)")
+            bot.use_healing()
+            return
+        _freeze = bot.find_item(ItemType.CROWD_CONTROL)
+        if _freeze and enemy and not enemy.has_status("Frozen"):
+            log("action: freeze enemy (inventory full — freeing slot)", enemy.position)
+            bot.use(_freeze)
+            return
+        # Nothing usable (heal at full HP, freeze already applied, or only Dizzy left)
+        # → inventory stays full; want_pickup will block new grabs
+
+    # ── want_pickup: only target tiles we still have room for ───────────────
+    # Dizzy (MOVEMENT type) is intentionally skipped — we never pick it up.
+    def want_pickup(t):
+        if is_card(t):
+            return len(me.cards) < 3        # card cap
+        if not is_pickup(t) or len(me.inventory) >= 3:
+            return False
+        item = t.get('Item') or t.get('item') if isinstance(t, dict) else None
+        if item and (item.get('ItemType') or item.get('itemType')) == ItemType.MOVEMENT:
+            return False                    # never pick up Dizzy
+        return True
+
+    # ── PHASE A: travel to center, grabbing pickups we can afford ───────────
+    # "Affordable" = extra detour cost fits inside our spare time budget before
+    # the next map shrink.  Automatically tight late-game, generous early-game.
     if not safe(me.position):
-        pickup = find_nearest(me, lambda t: is_pickup(t) and pickup_on_route(me, center, t))
+        _turns_left = world.turns_until_shrink()
+        _max_move   = me.max_move or 4
+        pickup = find_nearest(
+            me,
+            lambda t: want_pickup(t) and can_afford_pickup(
+                me, center, t, _turns_left, _max_move,
+            ),
+        )
         if pickup is not None and grab_or_approach(bot, me, world, pickup, log):
             return
         log("action: travel to center", center)
-        bot.move_toward(center) or bot.wander()    # always act — never freeze
+        if bot.move_toward(center, avoid_spikes=avoid_spikes) or bot.wander(avoid_spikes=avoid_spikes):
+            return
+        log("action: travel to center → STUCK (no legal move)")
         return
 
     # ── PHASE B: hold the zone — act only inside it, never leave ──
     if summon_monster(bot, me, enemy, center, safe, log, within=safe):
         return
 
-    if enemy and bot.can_attack(enemy) and safe(enemy.position):
-        log("action: attack enemy", enemy.position)
-        bot.attack(enemy)
+    # FREEZE: use before attacking when the enemy would survive a single hit.
+    # Frozen skips their entire next turn — guarantees our follow-up attack lands
+    # before they can flee, heal, or counter. No range requirement on freeze scroll.
+    # We don't check safe(enemy.position) — we attack from our tile, not theirs.
+    freeze = bot.find_item(ItemType.CROWD_CONTROL)
+    if (freeze and enemy
+            and safe(me.position)
+            and not enemy.has_status("Frozen")
+            and bot.is_adjacent(me, enemy)
+            and enemy.health > me.attack_power):
+        log("action: freeze enemy (survives 1 hit — locking in place)", enemy.position)
+        bot.use(freeze)
         return
 
-    target = find_nearest(me, lambda t: is_pickup(t) and safe(tile_position(t)))
+    # Attack: enemy player first, then any monsters they summoned.
+    # No safe() check on the target's position — we stay on our tile to attack.
+    _attack_targets = []
+    if enemy:
+        _attack_targets.append(enemy)
+    for _ent in world.enemies():
+        if _ent.id != (enemy.id if enemy else None):
+            _attack_targets.append(_ent)
+    for _tgt in _attack_targets:
+        if bot.can_attack(_tgt):
+            log("action: attack", _tgt.name or "entity", _tgt.position)
+            bot.attack(_tgt)
+            return
+
+    target = find_nearest(me, lambda t: want_pickup(t) and safe(tile_position(t)))
     if target and grab_or_approach(bot, me, world, target, log, within=safe):
         return
 
     if enemy and safe(enemy.position):         # enemy is in our zone — close in
-        log("action: close on enemy", enemy.position)
-        if bot.move_toward(enemy, within=safe):
+        log("action: try close on enemy", enemy.position)
+        if bot.move_toward(enemy, within=safe, avoid_spikes=avoid_spikes):
+            log("action: close on enemy → ok")
             return
+        log("action: close on enemy → no move (path blocked)")
 
     # The server has no "pass": always submit a move. Drift toward center (a
     # harmless shuffle once we're there); if boxed in, take any legal safe move.
     log("action: hold/shuffle toward center", center)
-    bot.move_toward(center, within=safe) or bot.wander(within=safe) or bot.wander()
+    if (bot.move_toward(center, within=safe, avoid_spikes=avoid_spikes)
+            or bot.wander(within=safe, avoid_spikes=avoid_spikes)
+            or bot.wander(avoid_spikes=avoid_spikes)):
+        return
+    log("action: hold/shuffle → STUCK (completely boxed in — turn will time out)")
 
 
 def _turn_key(state):

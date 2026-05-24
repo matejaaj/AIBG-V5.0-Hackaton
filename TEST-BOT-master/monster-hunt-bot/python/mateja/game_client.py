@@ -86,16 +86,39 @@ class Bot:
     # ── debugging helpers ───────────────────────────────────────────────────
     def snapshot(self):
         """One-line summary of the current turn — log this every turn."""
+        from pathfinding import reachable as _reachable
+        from game_api import ItemType as _IT
+        _abbr = {_IT.HEALING: 'Heal', _IT.MOVEMENT: 'Move', _IT.DEFENSE: 'Def',
+                 _IT.UTILITY: 'Util', _IT.CROWD_CONTROL: 'CC', _IT.ATTACK: 'Atk'}
         me, en, w = self.me, self.enemy, self.map
-        tc = self.state.get('TurnCounter', '?') if self.state else '?'
-        gs = self.state.get('GameState', '?') if self.state else '?'
-        here = w.is_permanently_safe(me.position) if (w and me) else '?'
-        d = w.distance(me.position, en.position) if (w and me and en) else '?'
+        tc     = self.state.get('TurnCounter', '?') if self.state else '?'
+        gs     = self.state.get('GameState',   '?') if self.state else '?'
+        here   = w.is_permanently_safe(me.position) if (w and me) else '?'
+        d      = w.distance(me.position, en.position) if (w and me and en) else '?'
+        dist_s = '∞' if d is None else d
         shrink = w.turns_until_shrink() if w else '?'
-        return (f"T{tc} {gs} | me={me.position if me else None} "
+        reach  = len(_reachable(me, 1)) if me else '?'
+
+        base = (f"T{tc} {gs} | me={me.position if me else None} "
                 f"hp={me.health if me else '?'}/{me.max_health if me else '?'} "
-                f"enemy={en.position if en else None} dist={d} "
-                f"safe_here={here} shrink_in={shrink}")
+                f"enemy={en.position if en else None} dist={dist_s} "
+                f"safe={here} shrink={shrink} reach={reach}")
+
+        extras = []
+        if me:
+            sts = {k: v for k, v in me.statuses.items() if int(v or 0) > 0}
+            if sts:
+                extras.append(f"sts={sts}")
+            inv = [_abbr.get(it.item_type, it.name or '?') for it in me.inventory]
+            if inv:
+                extras.append(f"inv=[{','.join(str(i) for i in inv)}]")
+            rdy = sum(1 for c in me.cards
+                      if not c.get('OnCooldown')
+                      and (c.get('Uses') is None or (c.get('Uses') or 0) > 0)
+                      and not (c.get('Monster') or {}).get('SummonedByPlayerId'))
+            if rdy:
+                extras.append(f"cards={rdy}rdy")
+        return base + (' | ' + ' '.join(extras) if extras else '')
 
     def save_state(self, path=None):
         """Dump the latest raw game state to a file (send this for debugging).
@@ -163,34 +186,51 @@ class Bot:
         url = f"{self.server_url}/player/move/gameId/{self.game_id}"
         return self._put(url, {"playerId": self.player_id, "newPosition": {"X": x, "Y": y}})
 
-    def move_toward(self, goal, within=None):
+    def move_toward(self, goal, within=None, avoid_spikes=False):
         """Move toward goal as far as this turn allows. If `within` (a pos->bool
         predicate) is given, only step to tiles satisfying it (e.g. the safe zone).
         Uses the route-aware path helper to spend the whole turn budget instead of
         taking only a single step.
+        If `avoid_spikes` is True, spike tiles are treated as impassable.
         Returns the server response, or None only if no legal (in-region) move exists."""
         if self.me is None:
             return None
         g = _pos(goal)
-        dest = find_path(self.me, goal)
+        dest = find_path(self.me, goal, avoid_spikes=avoid_spikes)
         if dest is not None and (within is None or within(dest)):
             return self.move(dest)
-        options = reachable(self.me, 1)
-        if within is not None:
-            options = {p for p in options if within(p)}
+        # Log why the primary path didn't work before falling back.
+        if dest is not None:
+            print(f"[BOT] move_toward: find_path→{dest} blocked by within-filter", flush=True)
+        else:
+            print(f"[BOT] move_toward: find_path→None (no path to {g})", flush=True)
+        all_opts = reachable(self.me, 1, avoid_spikes=avoid_spikes)
+        options = {p for p in all_opts if within(p)} if within is not None else set(all_opts)
         if not options:
+            print(f"[BOT] move_toward: 0/{len(all_opts)} reachable tiles pass filter — STUCK",
+                  flush=True)
             return None
         return self.move(min(options, key=lambda p: abs(p[0] - g[0]) + abs(p[1] - g[1])))
 
-    def wander(self, within=None):
+    def wander(self, within=None, avoid_spikes=False):
         """Make any legal move (preferring tiles satisfying `within`) so the turn
-        always advances — the server has no 'pass'. None only if completely boxed in."""
+        always advances — the server has no 'pass'. None only if completely boxed in.
+        If `avoid_spikes` is True, spike tiles are excluded from candidates (but if
+        spikes are the only option, they are used as a last resort)."""
         if self.me is None:
             return None
-        opts = reachable(self.me, 1)
+        opts = reachable(self.me, 1, avoid_spikes=avoid_spikes)
         pool = {p for p in opts if within(p)} if within is not None else set(opts)
-        pool = pool or set(opts)  # emergency: any legal move beats hanging the turn
-        return self.move(min(pool)) if pool else None
+        pool = pool or set(opts)  # if within filtered everything, use any reachable tile
+        if not pool and avoid_spikes:
+            # Emergency: spike avoidance left us stuck — allow spikes as last resort
+            opts = reachable(self.me, 1, avoid_spikes=False)
+            pool = {p for p in opts if within(p)} if within is not None else set(opts)
+            pool = pool or set(opts)
+        if not pool:
+            print(f"[BOT] wander: completely boxed in — 0 reachable tiles", flush=True)
+            return None
+        return self.move(min(pool))
 
     def can_attack(self, target):
         """True if target is on the same row/col within attack range. Note: the
@@ -203,7 +243,10 @@ class Bot:
         if self.me.has_status("Fatigue"):
             return False
         mx, my = self.me.position
-        tx, ty = _pos(target)
+        try:
+            tx, ty = _pos(target)
+        except (TypeError, ValueError):
+            return False
         if None in (mx, my, tx, ty):
             return False
         if mx != tx and my != ty:

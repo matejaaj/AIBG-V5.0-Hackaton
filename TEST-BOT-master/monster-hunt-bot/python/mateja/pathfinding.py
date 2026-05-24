@@ -158,12 +158,14 @@ def _neighbors(pos: Position, width: int, height: int):
             yield nx, ny
 
 
-def bfs(start: Position, goal: Position, game_map: Dict[str, Any]) -> Optional[Position]:
+def bfs(start: Position, goal: Position, game_map: Dict[str, Any],
+        avoid_spikes: bool = False) -> Optional[Position]:
     """Return the first turn-state step from start towards goal.
 
     The search frontier is turn-based: one edge means one legal move this turn,
     where the move may cover 1..max_move tiles in a straight line. This keeps
     the BFS state model aligned with the bot's actual turn mechanics.
+    If `avoid_spikes` is True, spike tiles are treated as impassable.
     """
     game_map = _resolve_map(game_map)
     if game_map is None:
@@ -178,7 +180,7 @@ def bfs(start: Position, goal: Position, game_map: Dict[str, Any]) -> Optional[P
     if not (0 <= g[0] < width and 0 <= g[1] < height):
         return None
 
-    root = TurnMoveState(game_map, s, _max_move_of(start), goal=g)
+    root = TurnMoveState(game_map, s, _max_move_of(start), goal=g, avoid_spikes=avoid_spikes)
     path, _, _ = BreadthFirstSearch(game_map).search(root)
     if path and len(path) > 1:
         return path[1].position
@@ -279,13 +281,15 @@ def _cell_is_blocked(cell) -> bool:
     )
 
 
-def _turn_moves(start, max_move, game_map, width, height, allow_blocked_final=None):
+def _turn_moves(start, max_move, game_map, width, height, allow_blocked_final=None,
+                avoid_spikes=False):
     """All legal end positions reachable in one turn from start.
 
     The move budget is spent in one straight direction. Each direction can travel
     1..max_move tiles, stopping before walls, empty tiles, and occupied tiles.
     If `allow_blocked_final` is provided, a blocked tile may be yielded as a
     final target when the callback returns True for that cell.
+    If `avoid_spikes` is True, spike tiles (Obstacle.Damage > 0) block movement.
     """
     tiles: Set[Position] = set()
     remaining_start = max_move
@@ -310,6 +314,8 @@ def _turn_moves(start, max_move, game_map, width, height, allow_blocked_final=No
                 if allow_blocked_final is not None and allow_blocked_final(cell):
                     tiles.add((nx, ny))
                 break
+            if avoid_spikes and _has_damage_obstacle(cell):
+                break
             tiles.add((nx, ny))
             x, y = nx, ny
             remaining -= cost
@@ -319,11 +325,13 @@ def _turn_moves(start, max_move, game_map, width, height, allow_blocked_final=No
 class TurnMoveState(SearchState):
     """Turn-based movement state: one node is one position after a turn move."""
 
-    def __init__(self, board, position, max_move, goal=None, parent=None, depth=0):
+    def __init__(self, board, position, max_move, goal=None, parent=None, depth=0,
+                 avoid_spikes=False):
         super().__init__(board, parent=parent, depth=depth)
         self.position = position
         self.max_move = max_move
         self.goal = goal
+        self.avoid_spikes = avoid_spikes
 
     def unique_hash(self):
         return self.position
@@ -333,9 +341,11 @@ class TurnMoveState(SearchState):
 
     def get_next_states(self):
         width, height = _get_map_size(self.board)
-        next_positions = _turn_moves(self.position, self.max_move, self.board, width, height)
+        next_positions = _turn_moves(self.position, self.max_move, self.board, width, height,
+                                     avoid_spikes=self.avoid_spikes)
         return [TurnMoveState(self.board, pos, self.max_move, goal=self.goal,
-                              parent=self, depth=self.depth + 1)
+                              parent=self, depth=self.depth + 1,
+                              avoid_spikes=self.avoid_spikes)
                 for pos in next_positions]
 
 
@@ -400,12 +410,14 @@ def _bfs_path(start, goal, game_map, width, height, avoid_spikes):
     return None
 
 
-def _walk_collect(start, dx, dy, max_move, game_map, width, height):
+def _walk_collect(start, dx, dy, max_move, game_map, width, height, avoid_spikes=False):
     """Every tile reachable in one straight move (dx,dy), mirroring the server.
 
     The server adds each intermediate tile, costs 2 for ice, stops before
     out-of-bounds / WALL / EMPTY / occupied tiles, and deducts 1 point upfront
-    when standing on ice."""
+    when standing on ice.
+    If `avoid_spikes` is True, spike tiles (Obstacle.Damage > 0) also stop movement.
+    """
     tiles: Set[Position] = set()
     remaining = max_move
     if _get_field_type_at(game_map, start[0], start[1], width, height) == OBSTACLE_SLOW:
@@ -424,26 +436,33 @@ def _walk_collect(start, dx, dy, max_move, game_map, width, height):
         cell = _get_cell_at(game_map, nx, ny, width, height)
         if _cell_is_blocked(cell):
             break
+        if avoid_spikes and _has_damage_obstacle(cell):
+            break
         tiles.add((nx, ny))
         x, y = nx, ny
         remaining -= cost
     return tiles
 
 
-def _reachable_one_turn(start, max_move, game_map, width, height):
+def _reachable_one_turn(start, max_move, game_map, width, height, avoid_spikes=False):
     out: Set[Position] = set()
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-        out |= _walk_collect(start, dx, dy, max_move, game_map, width, height)
+        out |= _walk_collect(start, dx, dy, max_move, game_map, width, height,
+                             avoid_spikes=avoid_spikes)
     return out
 
 
-def find_path(start, goal, game_map: Dict[str, Any] = None) -> Optional[Position]:
-    """Best tile to MOVE to this turn, heading toward goal."""
-    return bfs(start, goal, game_map)
+def find_path(start, goal, game_map: Dict[str, Any] = None,
+              avoid_spikes: bool = False) -> Optional[Position]:
+    """Best tile to MOVE to this turn, heading toward goal.
+    If `avoid_spikes` is True, spike tiles are treated as impassable."""
+    return bfs(start, goal, game_map, avoid_spikes=avoid_spikes)
 
 
-def reachable(start, turns: int = 1, game_map: Dict[str, Any] = None) -> Set[Position]:
-    """Set of standable tiles reachable within `turns` turns."""
+def reachable(start, turns: int = 1, game_map: Dict[str, Any] = None,
+              avoid_spikes: bool = False) -> Set[Position]:
+    """Set of standable tiles reachable within `turns` turns.
+    If `avoid_spikes` is True, spike tiles are excluded from the result."""
     game_map = _resolve_map(game_map)
     if game_map is None:
         return set()
@@ -460,7 +479,8 @@ def reachable(start, turns: int = 1, game_map: Dict[str, Any] = None) -> Set[Pos
     for _ in range(max(1, int(turns))):
         next_frontier: Set[Position] = set()
         for tile in frontier:
-            next_frontier |= _turn_moves(tile, max_move, game_map, width, height)
+            next_frontier |= _turn_moves(tile, max_move, game_map, width, height,
+                                         avoid_spikes=avoid_spikes)
         next_frontier -= visited
         if not next_frontier:
             break
@@ -517,15 +537,20 @@ if __name__ == "__main__":
     assert step == (0, 1), f"Test 1 failed: {step}"
     print('Test 1 passed: wall blocks, BFS routes around')
 
-    # ── Test 2: spike tile is treated as impassable ───────────────────────────
+    # ── Test 2: avoid_spikes=True routes around a spike tile ─────────────────
     grid2 = [cell(NORMAL)] * (W * H)
     grid2[_index(1, 0, W, H)] = cell(NORMAL, damage=15)  # spike at (1,0)
     m2 = make_map(grid2)
-    step = bfs((0, 0), (2, 0), m2)
+    step = bfs((0, 0), (2, 0), m2, avoid_spikes=True)
     assert step == (0, 1), f"Test 2 failed: {step}"
-    print('Test 2 passed: spike tile avoided, BFS routes around')
+    print('Test 2 passed: avoid_spikes=True routes around spike')
 
-    # ── Test 3: spike is only path — BFS takes it as fallback ───────────────
+    # ── Test 2b: default (avoid_spikes=False) goes straight through spike ────
+    step2b = bfs((0, 0), (2, 0), m2)
+    assert step2b == (2, 0), f"Test 2b failed: expected (2,0) through spike, got {step2b}"
+    print('Test 2b passed: default bfs traverses spike tile directly')
+
+    # ── Test 3: spike is only path — bfs(avoid_spikes=False) reaches goal ────
     grid3 = [cell(NORMAL)] * (W * H)
     # block all routes except through spike at (1,0)
     for y in range(1, H):
@@ -534,10 +559,13 @@ if __name__ == "__main__":
         grid3[_index(2, y, W, H)] = cell(WALL)
     grid3[_index(1, 0, W, H)] = cell(NORMAL, damage=15)  # spike, but only path
     m3 = make_map(grid3)
-    step = bfs((0, 0), (2, 0), m3)
-    # Only path goes through spike — fallback should take it
-    assert step == (1, 0), f"Test 3 failed: expected (1,0), got {step}"
-    print('Test 3 passed: spike is only path — BFS takes it as fallback')
+    step = bfs((0, 0), (2, 0), m3)  # avoid_spikes=False (default)
+    # max_move=4: bot reaches (2,0) in one turn (through spike, 1+1=2 budget)
+    assert step == (2, 0), f"Test 3 failed: expected (2,0) straight through, got {step}"
+    # With avoid_spikes=True the goal is unreachable (no detour exists)
+    step3b = bfs((0, 0), (2, 0), m3, avoid_spikes=True)
+    assert step3b is None, f"Test 3b failed: expected None, got {step3b}"
+    print('Test 3 passed: spike is only path — default reaches it, avoid_spikes=True gives None')
 
     # ── Test 4: flood_fill excludes spike tiles ───────────────────────────────
     grid4 = [cell(NORMAL)] * (W * H)

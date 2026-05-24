@@ -17,7 +17,12 @@ def grab_or_approach(bot, me, world, target, log, within=None):
 def ready_monster_card(card):
     if not isinstance(card, dict):
         return False
-    if not _get(card, "Monster", "monster"):
+    monster = _get(card, "Monster", "monster")
+    if not monster:
+        return False
+    # Monster is already alive on the map — cannot summon a second instance.
+    # SummonedByPlayerId is set when the monster is placed, cleared when it dies.
+    if _get(monster, "SummonedByPlayerId", "summonedByPlayerId") is not None:
         return False
     if _get(card, "OnCooldown", "onCooldown", default=False):
         return False
@@ -59,17 +64,27 @@ def summon_monster(bot, me, enemy, center, safe, log, within=None):
     return bool(bot.summon(card, pos))
 
 
-def pickup_on_route(me, center, tile):
-    """True when a pickup tile lies on a shortest path to center."""
+def can_afford_pickup(me, center, tile, turns_until_shrink, max_move):
+    """True if we can reach tile AND then center before the next map shrink.
+
+    Uses two-phase turn estimation:
+      leg 1 — current position → pickup  (ceil(dist / max_move) turns)
+      leg 2 — pickup position  → center  (ceil(dist / max_move) turns, fresh start)
+    Each leg is ceilinged separately because each turn can only move in one
+    straight direction, so the direction reset between legs is a real cost.
+
+    One additional turn is kept as a safety margin.
+    If turns_until_shrink is None (all shrinks done) there is no time pressure.
+    """
     pickup_pos = tile_position(tile)
     if pickup_pos is None:
         return False
-    me_to_pickup = distance(me, pickup_pos)
+    me_to_pickup     = distance(me, pickup_pos)
     pickup_to_center = distance(pickup_pos, center)
-    me_to_center = distance(me, center)
-    return (
-        me_to_pickup is not None
-        and pickup_to_center is not None
-        and me_to_center is not None
-        and me_to_pickup + pickup_to_center == me_to_center
-    )
+    if me_to_pickup is None or pickup_to_center is None:
+        return False
+    if turns_until_shrink is None:
+        return True     # no more shrinks — grab anything reachable
+    turns_leg1 = (me_to_pickup     + max_move - 1) // max_move
+    turns_leg2 = (pickup_to_center + max_move - 1) // max_move
+    return turns_leg1 + turns_leg2 <= turns_until_shrink - 1  # -1 safety margin

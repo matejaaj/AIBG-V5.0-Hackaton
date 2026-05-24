@@ -297,9 +297,18 @@ class World:
     def _all_entities(self):
         out = []
         for tile in self._grid:
-            ent = _get(tile, 'Entity', 'entity') if isinstance(tile, dict) else None
-            if ent:
-                out.append(Entity(ent))
+            if not isinstance(tile, dict):
+                continue
+            ent_raw = _get(tile, 'Entity', 'entity')
+            if not ent_raw:
+                continue
+            # Entities stored in map tiles often lack a Position field — inject it
+            # from the tile so entity.position works correctly for targeting/attack.
+            if not _get(ent_raw, 'Position', 'position'):
+                tile_pos = _get(tile, 'Position', 'position')
+                if tile_pos:
+                    ent_raw = {**ent_raw, 'Position': tile_pos}
+            out.append(Entity(ent_raw))
         return out
 
     def _is_mine(self, ent):
