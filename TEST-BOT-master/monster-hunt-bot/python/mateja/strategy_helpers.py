@@ -1,6 +1,6 @@
 """Shared strategy helpers used by `final.py`."""
 from game_api import is_card, tile_position, _get
-from pathfinding import distance
+from pathfinding import distance, reachable
 
 
 def grab_or_approach(bot, me, world, target, log, within=None):
@@ -49,6 +49,26 @@ def summon_monster(bot, me, enemy, center, safe, log, within=None):
         tiles.append(pos)
     if not tiles:
         return False
+    # Self-trap guard: never summon on the only ray of tiles we can move into.
+    # `reachable(me, 1)` walks straight rays from us; if every reachable tile is
+    # collinear with `pos` (same orthogonal direction), placing a monster on
+    # `pos` cuts the entire ray and zeros our reach next turn.
+    mx, my = me.position
+    my_reach = reachable(me, 1)
+    def _self_traps(pos):
+        px, py = pos
+        if not my_reach:
+            return True
+        if px == mx:
+            dy = py - my
+            return all(p[0] == mx and (p[1] - my) * dy > 0 for p in my_reach)
+        dx = px - mx
+        return all(p[1] == my and (p[0] - mx) * dx > 0 for p in my_reach)
+    safe_tiles = [t for t in tiles if not _self_traps(t)]
+    if not safe_tiles:
+        log("action: skip summon (would self-trap — only escape tile)")
+        return False
+    tiles = safe_tiles
     goal = enemy.position if enemy and enemy.position and safe(enemy.position) else center
     pos = min(
         tiles,

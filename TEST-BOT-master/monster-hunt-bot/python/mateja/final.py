@@ -217,7 +217,8 @@ def decide(bot):
             or bot.wander(within=safe, avoid_spikes=avoid_spikes)
             or bot.wander(avoid_spikes=avoid_spikes)):
         return
-    log("action: hold/shuffle → STUCK (completely boxed in — turn will time out)")
+    log("action: hold/shuffle → STUCK (completely boxed in — turn will time out)"
+        f" last_status={bot._last_action_status}")
 
 
 def _turn_key(state):
